@@ -493,8 +493,7 @@ mpage_lookup(struct btree *bt, pgno_t pgno)
 	return mp;
 }
 
-static void
-mpage_add(struct btree *bt, struct mpage *mp)
+static void mpage_add(struct btree *bt, struct mpage *mp)
 {
 	assert(RB_INSERT(page_cache, bt->page_cache, mp) == NULL);
 	bt->stat.cache_size++;
@@ -572,8 +571,7 @@ mpage_prune(struct btree *bt)
 
 /* Mark a page as dirty and push it on the dirty queue.
  */
-static void
-mpage_dirty(struct btree *bt, struct mpage *mp)
+static void mpage_dirty(struct btree *bt, struct mpage *mp)
 {
 	assert(bt != NULL);
 	assert(bt->txn != NULL);
@@ -614,8 +612,7 @@ mpage_touch(struct btree *bt, struct mpage *mp)
 	return mp;
 }
 
-static int
-btree_read_page(struct btree *bt, pgno_t pgno, struct page *page)
+static int btree_read_page(struct btree *bt, pgno_t pgno, struct page *page)
 {
 	ssize_t		 rc;
 
@@ -643,8 +640,7 @@ btree_read_page(struct btree *bt, pgno_t pgno, struct page *page)
 	return BT_SUCCESS;
 }
 
-int
-btree_sync(struct btree *bt)
+int btree_sync(struct btree *bt)
 {
 	if (!F_ISSET(bt->flags, BT_NOSYNC))
 		return fsync(bt->fd);
@@ -738,8 +734,7 @@ btree_txn_abort(struct btree_txn *txn)
 	free(txn);
 }
 
-int
-btree_txn_commit(struct btree_txn *txn)
+int btree_txn_commit(struct btree_txn *txn)
 {
 	int		 n, done;
 	ssize_t		 rc;
@@ -977,8 +972,7 @@ static int btree_write_meta(struct btree *bt, pgno_t root, unsigned int flags)
 
 /* Returns true if page p is a valid meta page, false otherwise.
  */
-static int
-btree_is_meta_page(struct page *p)
+static int btree_is_meta_page(struct page *p)
 {
 	struct bt_meta	*m;
 	unsigned char	 hash[SHA1_DIGEST_LENGTH];
@@ -1292,8 +1286,7 @@ cursor_push_page(struct cursor *cursor, struct mpage *mp)
 	return ppage;
 }
 
-static struct mpage *
-btree_get_mpage(struct btree *bt, pgno_t pgno)
+static struct mpage * btree_get_mpage(struct btree *bt, pgno_t pgno)
 {
 	struct mpage	*mp;
 
@@ -1843,8 +1836,7 @@ btree_cursor_get(struct cursor *cursor, struct btval *key, struct btval *data,
 	return rc;
 }
 
-static struct mpage *
-btree_new_page(struct btree *bt, uint32_t flags)
+static struct mpage * btree_new_page(struct btree *bt, uint32_t flags)
 {
 	struct mpage	*mp;
 
