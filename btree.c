@@ -1195,8 +1195,7 @@ btree_close(struct btree *bt)
  * If no entry larger of equal to the key is found, returns NULL.
  */
 static struct node *
-btree_search_node(struct btree *bt, struct mpage *mp, struct btval *key,
-    int *exactp, unsigned int *kip)
+btree_search_node(struct btree *bt, struct mpage *mp, struct btval *key,int *exactp, unsigned int *kip)
 {
 	unsigned int	 i = 0;
 	int		 low, high;
@@ -1228,11 +1227,9 @@ btree_search_node(struct btree *bt, struct mpage *mp, struct btval *key,
 			rc = bt_cmp(bt, key, &nodekey, &mp->prefix);
 
 		if (IS_LEAF(mp))
-			DPRINTF("found leaf index %u [%.*s], rc = %i",
-			    i, (int)nodekey.size, (char *)nodekey.data, rc);
+			DPRINTF("found leaf index %u [%.*s], rc = %i",i, (int)nodekey.size, (char *)nodekey.data, rc);
 		else
-			DPRINTF("found branch index %u [%.*s -> %u], rc = %i",
-			    i, (int)node->ksize, (char *)NODEKEY(node),
+			DPRINTF("found branch index %u [%.*s -> %u], rc = %i",i, (int)node->ksize, (char *)NODEKEY(node),
 			    node->n_pgno, rc);
 
 		if (rc == 0)
@@ -1934,9 +1931,7 @@ btree_write_overflow_data(struct btree *bt, struct page *p, struct btval *data)
 
 /* Key prefix should already be stripped.
  */
-static int
-btree_add_node(struct btree *bt, struct mpage *mp, indx_t indx,
-    struct btval *key, struct btval *data, pgno_t pgno, uint8_t flags)
+static int btree_add_node(struct btree *bt, struct mpage *mp, indx_t indx, struct btval *key, struct btval *data, pgno_t pgno, uint8_t flags)
 {
 	unsigned int	 i;
 	size_t		 node_size = NODESIZE;
