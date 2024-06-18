@@ -28,10 +28,10 @@ struct cursor;
 struct btree_txn;
 
 struct btval {
-	void		*data;
-	size_t		 size;
-	int		 free_data;		/* true if data malloc'd */
-	struct mpage	*mp;			/* ref'd memory page */
+	void*			data;
+	size_t		 	size;
+	int		 		free_data;		/* true if data malloc'd */
+	struct mpage*	mp;			/* ref'd memory page */
 };
 
 typedef int		 (*bt_cmp_func)(const struct btval *a,const struct btval *b);
