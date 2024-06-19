@@ -22,9 +22,8 @@
 #include <sys/queue.h>
 #include <sys/param.h>
 #include <sys/uio.h>
-#ifdef HAVE_SYS_FILE_H
+
 #include <sys/file.h>
-#endif
 
 #include <assert.h>
 #include <err.h>
@@ -163,11 +162,17 @@ RB_PROTOTYPE(page_cache, mpage, entry, mpage_cmp);
 RB_GENERATE(page_cache, mpage, entry, mpage_cmp);
 
 struct ppage {					/* ordered list of pages */
-	SLIST_ENTRY(ppage)	 entry;
+	//SLIST_ENTRY(ppage)	 entry;
+	struct {								
+		struct ppage *sle_next;	/* next element */			
+	}entry;
 	struct mpage		*mpage;
 	unsigned int		 ki;		/* cursor index on page */
 };
-SLIST_HEAD(page_stack, ppage);
+//SLIST_HEAD(page_stack, ppage);
+struct page_stack {								
+	struct ppage *slh_first;	/* first element */			
+};
 
 #define CURSOR_EMPTY(c)		 SLIST_EMPTY(&(c)->stack)
 #define CURSOR_TOP(c)		 SLIST_FIRST(&(c)->stack)
@@ -557,8 +562,7 @@ mpage_copy(struct btree *bt, struct mpage *mp)
  * within the configured bounds. Pages referenced by cursors or returned
  * key/data are not pruned.
  */
-static void
-mpage_prune(struct btree *bt)
+static void mpage_prune(struct btree *bt)
 {
 	struct mpage	*mp, *next;
 
@@ -651,8 +655,7 @@ int btree_sync(struct btree *bt)
 	return 0;
 }
 
-struct btree_txn *
-btree_txn_begin(struct btree *bt, int rdonly)
+struct btree_txn * btree_txn_begin(struct btree *bt, int rdonly)
 {
 	struct btree_txn	*txn;
 
@@ -1257,32 +1260,36 @@ static struct node * btree_search_node(struct btree *bt, struct mpage *mp, struc
 	return (struct node *)((char *)(mp->page) + mp->page->ptrs[i]); //NODEPTR(mp, i);
 }
 
-static void
-cursor_pop_page(struct cursor *cursor)
+static void cursor_pop_page(struct cursor *cursor)
 {
-	struct ppage	*top;
+	//struct ppage	*top = CURSOR_TOP(cursor);
+	// SLIST_REMOVE_HEAD(&cursor->stack, entry);//CURSOR_POP(cursor);
+		
+	  	struct page_stack* head= &cursor->stack;
+	  	struct ppage* top_ppage= head->slh_first;
+		head->slh_first = top_ppage->entry.sle_next;		
 
-	top = CURSOR_TOP(cursor);
-	CURSOR_POP(cursor);
-	top->mpage->ref--;
+	top_ppage->mpage->ref--;
 
-	DPRINTF("popped page %u off cursor %p", top->mpage->pgno, cursor);
+	DPRINTF("popped page %u off cursor %p", top_ppage->mpage->pgno, cursor);
 
-	free(top);
+	free(top_ppage);
 }
 
-static struct ppage *
-cursor_push_page(struct cursor *cursor, struct mpage *mp)
+static struct ppage * cursor_push_page(struct cursor *cursor, struct mpage *mp)
 {
-	struct ppage	*ppage;
+	
 
 	DPRINTF("pushing page %u on cursor %p", mp->pgno, cursor);
-
+	struct ppage	*ppage;
 	if ((ppage = calloc(1, sizeof(*ppage))) == NULL)
 		return NULL;
 	ppage->mpage = mp;
 	mp->ref++;
-	CURSOR_PUSH(cursor, ppage);
+	// SLIST_INSERT_HEAD(&cursor->stack, ppage, entry);//CURSOR_PUSH(cursor, ppage);
+	  struct page_stack * const head=&cursor->stack;
+	 ppage->entry.sle_next = head->slh_first;			
+	head->slh_first = ppage;					
 	return ppage;
 }
 
@@ -1592,22 +1599,22 @@ btree_txn_get(struct btree *bt, struct btree_txn *txn,struct btval *key, struct 
 	return rc;
 }
 
-static int
-btree_sibling(struct cursor *cursor, int move_right)
+static int btree_sibling(struct cursor *cursor, int move_right)
 {
 	int		 rc;
-	struct node	*indx;
-	struct ppage	*parent, *top;
+	
+
 	struct mpage	*mp;
 
-	top = CURSOR_TOP(cursor);
-	if ((parent = SLIST_NEXT(top, entry)) == NULL) {
+	struct ppage* const top = CURSOR_TOP(cursor);
+	struct ppage	*parent;
+	//((elm)->field.sle_next)
+	if ((parent = top->entry.sle_next/*SLIST_NEXT(top, entry)*/) == NULL) {
 		errno = ENOENT;
 		return BT_FAIL;			/* root has no siblings */
 	}
 
-	DPRINTF("parent page is page %u, index %u",
-	    parent->mpage->pgno, parent->ki);
+	DPRINTF("parent page is page %u, index %u",parent->mpage->pgno, parent->ki);
 
 	cursor_pop_page(cursor);
 	if (move_right ? (parent->ki + 1 >= NUMKEYS(parent->mpage))
@@ -1622,12 +1629,12 @@ btree_sibling(struct cursor *cursor, int move_right)
 			parent->ki++;
 		else
 			parent->ki--;
-		DPRINTF("just moving to %s index key %u",
-		    move_right ? "right" : "left", parent->ki);
+		DPRINTF("just moving to %s index key %u", move_right ? "right" : "left", parent->ki);
 	}
 	assert(IS_BRANCH(parent->mpage));
 
-	indx = NODEPTR(parent->mpage, parent->ki);
+	//indx = NODEPTR(parent->mpage, parent->ki);
+	const struct node* const indx = (struct node*)((char*)parent->mpage->page + parent->mpage->page->ptrs[parent->ki]);
 	if ((mp = btree_get_mpage(cursor->bt, indx->n_pgno)) == NULL)
 		return BT_FAIL;
 	mp->parent = parent->mpage;
@@ -1789,9 +1796,7 @@ btree_cursor_first(struct cursor *cursor, struct btval *key, struct btval *data)
 	return BT_SUCCESS;
 }
 
-int
-btree_cursor_get(struct cursor *cursor, struct btval *key, struct btval *data,
-    enum cursor_op op)
+int btree_cursor_get(struct cursor *cursor, struct btval *key, struct btval *data,enum cursor_op op)
 {
 	int		 rc;
 	int		 exact = 0;
@@ -1801,7 +1806,7 @@ btree_cursor_get(struct cursor *cursor, struct btval *key, struct btval *data,
 	switch (op) {
 	case BT_CURSOR:
 	case BT_CURSOR_EXACT:
-		while (CURSOR_TOP(cursor) != NULL)
+		while (SLIST_FIRST(&cursor->stack) != NULL)
 			cursor_pop_page(cursor);
 		if (key == NULL || key->size == 0 || key->size > MAXKEYSIZE) {
 			errno = EINVAL;
@@ -1866,18 +1871,15 @@ static struct mpage * btree_new_page(struct btree *bt, uint32_t flags)
 	return mp;
 }
 
-static size_t
-bt_leaf_size(struct btree *bt, struct btval *key, struct btval *data)
+static size_t bt_leaf_size(struct btree *bt, struct btval *key, struct btval *data)
 {
-	size_t		 sz;
-
-	sz = LEAFSIZE(key, data);
+	size_t		 sz =  NODESIZE + key->size + data->size;//LEAFSIZE(key, data);
 	if (data->size >= bt->head.psize / BT_MINKEYS) {
 		/* put on overflow page */
 		sz -= data->size - sizeof(pgno_t);
 	}
 
-	return sz + sizeof(indx_t);
+	return sz + sizeof(indx_t); // key_size, data_size, offset_size
 }
 
 static size_t
@@ -2022,8 +2024,7 @@ static int btree_add_node(struct btree *bt, struct mpage *mp, indx_t indx, struc
 	return BT_SUCCESS;
 }
 
-static void
-btree_del_node(struct mpage *mp, indx_t indx)
+static void btree_del_node(struct mpage *mp, indx_t indx)
 {
 	unsigned int	 sz;
 	indx_t		 i, j, numkeys, ptr;
@@ -2723,8 +2724,7 @@ btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newindxp,
 		bt->meta.depth++;
 
 		/* Add left (implicit) pointer. */
-		if (btree_add_node(bt, mp->parent, 0, NULL, NULL,
-		    mp->pgno, 0) != BT_SUCCESS)
+		if (btree_add_node(bt, mp->parent, 0, NULL, NULL, mp->pgno, 0) != BT_SUCCESS)
 			return BT_FAIL;
 	} else {
 		DPRINTF("parent branch page is %u", mp->parent->pgno);
@@ -2873,8 +2873,7 @@ btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newindxp,
 	return rc;
 }
 
-int btree_txn_put(struct btree *bt, struct btree_txn *txn,
-    struct btval *key, struct btval *data, unsigned int flags)
+int btree_txn_put(struct btree *bt, struct btree_txn *txn,struct btval *key, struct btval *data, unsigned int flags)
 {
 	int		 rc = BT_SUCCESS, exact, close_txn = 0;
 	unsigned int	 ki;
@@ -2958,7 +2957,7 @@ int btree_txn_put(struct btree *bt, struct btree_txn *txn,
 	xkey.data = key->data;
 	xkey.size = key->size;
 
-	if (SIZELEFT(mp) < bt_leaf_size(bt, key, data)) {
+	if ( (indx_t)(mp->page->upper - mp->page->lower) < bt_leaf_size(bt, key, data)) {
 		rc = btree_split(bt, &mp, &ki, &xkey, data, P_INVALID);
 	} else {
 		/* There is room already in this leaf page. */
@@ -2982,8 +2981,7 @@ done:
 	return rc;
 }
 
-static pgno_t
-btree_compact_tree(struct btree *bt, pgno_t pgno, struct btree *btc)
+static pgno_t btree_compact_tree(struct btree *bt, pgno_t pgno, struct btree *btc)
 {
 	ssize_t		 rc;
 	indx_t		 i;
@@ -3050,9 +3048,9 @@ int
 btree_compact(struct btree *bt)
 {
 	char			*compact_path = NULL;
-	struct btree		*btc;
+
 	struct btree_txn	*txn, *txnc = NULL;
-	int			 fd;
+	
 	pgno_t			 root;
 
 	assert(bt != NULL);
@@ -3071,13 +3069,13 @@ btree_compact(struct btree *bt)
 		btree_txn_abort(txn);
 		return BT_FAIL;
 	}
-	fd = mkstemp(compact_path);
+	int			 fd = mkstemp(compact_path);
 	if (fd == -1) {
 		free(compact_path);
 		btree_txn_abort(txn);
 		return BT_FAIL;
 	}
-
+	struct btree		*btc;
 	if ((btc = btree_open_fd(fd, 0)) == NULL)
 		goto failed;
 	memcpy(&btc->meta, &bt->meta, sizeof(bt->meta));

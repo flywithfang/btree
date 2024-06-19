@@ -25,9 +25,10 @@
 #include <string.h>
 
 #include "btree.h"
+#include <assert.h>
+#include <unistd.h>
 
-int
-main(int argc, char **argv)
+int main(int argc, char **argv)
 {
 	int		 c, rc = BT_FAIL;
 	unsigned int	 flags = 0;
@@ -73,7 +74,32 @@ main(int argc, char **argv)
 			printf("OK\n");
 		else
 			printf("FAIL\n");
-	} else if (strcmp(argv[0], "del") == 0) {
+	}else	if (strcmp(argv[0], "putn") == 0) {
+		if (argc < 4)
+			errx(1, "missing arguments");
+		int n =atoi(argv[3]);
+		struct btree_txn	* txn=btree_txn_begin(bt,0);
+		assert(txn);
+		char  buf[1024];
+		for(int k=0;k<n;++k){
+			snprintf(buf, sizeof(buf),"%s_%d",argv[1],k);
+		//	printf("%s\n",buf);
+			key.data = buf;
+			key.size = strlen(key.data);
+			data.data = argv[2];
+			data.size = strlen(data.data);
+			assert(data.size);
+			//rc = btree_put(bt, &key, &data, 0);
+			rc = btree_txn_put(bt,txn,&key,&data,0);
+			if (rc == BT_SUCCESS)
+				printf("OK %s\n",buf);
+			else
+				printf("FAIL /%s\n",buf);
+		}
+		btree_txn_commit(txn);
+		
+	}
+	 else if (strcmp(argv[0], "del") == 0) {
 		if (argc < 1)
 			errx(1, "missing argument");
 		key.data = argv[1];
@@ -115,7 +141,32 @@ main(int argc, char **argv)
 			flags = BT_NEXT;
 		}
 		btree_cursor_close(cursor);
-	} else if (strcmp(argv[0], "compact") == 0) {
+	}else if (strcmp(argv[0], "scan2") == 0) {
+		if (argc > 1) {
+			key.data = argv[1];
+			key.size = strlen(key.data);
+			flags = BT_CURSOR;
+		}
+		else
+			flags = BT_FIRST;
+		if (argc > 2) {
+			maxkey.data = argv[2];
+			maxkey.size = strlen(key.data);
+		}
+
+		cursor = btree_cursor_open(bt);
+		for(;;)
+		{	
+			while ((rc = btree_cursor_get(cursor, &key, &data,flags)) == BT_SUCCESS) {
+				if (argc > 2 && btree_cmp(bt, &key, &maxkey) > 0)
+					break;
+				printf("OK %zi %.*s\n", key.size, (int)key.size, (char *)key.data);
+				flags = BT_NEXT;
+				sleep(1);
+			}
+		}
+		btree_cursor_close(cursor);
+	}  else if (strcmp(argv[0], "compact") == 0) {
 		if ((rc = btree_compact(bt)) != BT_SUCCESS)
 			warn("compact");
 	} else if (strcmp(argv[0], "revert") == 0) {
