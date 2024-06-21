@@ -26,21 +26,49 @@
 
 #include "btree.h"
 #include <assert.h>
+#include <time.h>
 #include <unistd.h>
-
+#include <stdint.h>
+#include <stdlib.h>
+uint64_t get_cur_us() {
+      struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+void dump_stat(struct btree* bt){
+const struct btree_stat * const i= btree_stat(bt);
+		const size_t created_at= i->created_at;
+		printf("timestamp: %s\n", ctime(&created_at));
+		printf("depth: %u\n", i->depth);
+		printf("entries: %llu\n", i->entries);
+		printf("revisions: %u\n", i->revisions);
+		printf("branch pages: %u\n", i->branch_pages);
+		printf("leaf pages: %u\n", i->leaf_pages);
+		printf("overflow pages: %u\n", i->overflow_pages);
+		printf("cache_size: %u\n", i->cache_size);
+		printf("max_cache: %u\n", i->max_cache);
+		printf("hits: %llu\n", i->hits);
+		printf("misses: %llu\n", i->misses);
+		printf("reads: %llu\n", i->reads);
+		printf("writes: %llu\n", i->writes);
+		printf("fsyncs: %llu\n", i->fsyncs);
+}
 int main(int argc, char **argv)
 {
 	int		 c, rc = BT_FAIL;
 	unsigned int	 flags = 0;
-	struct btree	*bt;
+	
 	struct cursor	*cursor;
 	const char	*filename = "test.db";
 	struct btval	 key, data, maxkey;
 
-	while ((c = getopt(argc, argv, "rf:")) != -1) {
+	while ((c = getopt(argc, argv, "nrf:")) != -1) {
 		switch (c) {
 		case 'r':
 			flags |= BT_REVERSEKEY;
+			break;
+		case 'n':
+			flags |= BT_NOSYNC;
 			break;
 		case 'f':
 			filename = optarg;
@@ -54,15 +82,18 @@ int main(int argc, char **argv)
 	if (argc == 0)
 		errx(1, "missing command");
 
-	bt = btree_open(filename, flags | BT_NOSYNC, 0644);
+	struct btree	*bt = btree_open(filename, flags, 0644);
 	if (bt == NULL)
 		err(1, filename);
 
-	bzero(&key, sizeof(key));
-	bzero(&data, sizeof(data));
-	bzero(&maxkey, sizeof(maxkey));
+	memset(&key, 0,sizeof(key));
+	memset(&data,0, sizeof(data));
+	memset(&maxkey,0, sizeof(maxkey));
 
-	if (strcmp(argv[0], "put") == 0) {
+	if (strcmp(argv[0], "info") == 0) {
+		dump_stat(bt);
+	}
+	else if (strcmp(argv[0], "put") == 0) {
 		if (argc < 3)
 			errx(1, "missing arguments");
 		key.data = argv[1];
@@ -78,6 +109,7 @@ int main(int argc, char **argv)
 		if (argc < 4)
 			errx(1, "missing arguments");
 		int n =atoi(argv[3]);
+		const uint64_t st=get_cur_us();
 		struct btree_txn	* txn=btree_txn_begin(bt,0);
 		assert(txn);
 		char  buf[1024];
@@ -91,12 +123,17 @@ int main(int argc, char **argv)
 			assert(data.size);
 			//rc = btree_put(bt, &key, &data, 0);
 			rc = btree_txn_put(bt,txn,&key,&data,0);
-			if (rc == BT_SUCCESS)
+			assert(rc==BT_SUCCESS);
+			/*if (rc == BT_SUCCESS)
 				printf("OK %s\n",buf);
 			else
 				printf("FAIL /%s\n",buf);
+				*/
 		}
 		btree_txn_commit(txn);
+		const uint64_t et=get_cur_us();
+		printf("putn %lu us\n", et-st);
+		
 		
 	}
 	 else if (strcmp(argv[0], "del") == 0) {
@@ -112,9 +149,13 @@ int main(int argc, char **argv)
 	} else if (strcmp(argv[0], "get") == 0) {
 		if (argc < 2)
 			errx(1, "missing arguments");
+		const uint64_t st=get_cur_us();
 		key.data = argv[1];
 		key.size = strlen(key.data);
 		rc = btree_get(bt, &key, &data);
+		const uint64_t et=get_cur_us();
+		printf("get %lu us\n", et-st);
+		
 		if (rc == BT_SUCCESS) {
 			printf("OK %.*s\n", (int)data.size, (char *)data.data);
 		} else {
@@ -167,14 +208,17 @@ int main(int argc, char **argv)
 		}
 		btree_cursor_close(cursor);
 	}  else if (strcmp(argv[0], "compact") == 0) {
+		const uint64_t st=get_cur_us();
 		if ((rc = btree_compact(bt)) != BT_SUCCESS)
 			warn("compact");
+				const uint64_t et=get_cur_us();
+		printf("compact %lu us\n", et-st);
 	} else if (strcmp(argv[0], "revert") == 0) {
 		if ((rc = btree_revert(bt)) != BT_SUCCESS)
 			warn("revert");
 	} else
 		errx(1, "%s: invalid command", argv[0]);
-
+	dump_stat(bt);
 	btree_close(bt);
 
 	return rc;

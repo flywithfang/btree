@@ -59,6 +59,7 @@ enum cursor_op {				/* cursor operations */
 
 struct btree_stat {
 	unsigned long long int	 hits;		/* cache hits */
+	unsigned long long int	 misses;		/* cache hits */
 	unsigned long long int	 reads;		/* page reads */
 	unsigned int		 max_cache;	/* max cached pages */
 	unsigned int		 cache_size;	/* current cache size */
@@ -70,6 +71,8 @@ struct btree_stat {
 	unsigned long long int	 entries;
 	unsigned int		 psize;
 	time_t			 created_at;
+	unsigned long long int writes;
+	unsigned long long int fsyncs;
 };
 
 struct btree		*btree_open_fd(int fd, unsigned int flags);

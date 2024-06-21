@@ -15,7 +15,7 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-
+#define _POSIX_C_SOURCE 199309L
 #include <sys/types.h>
 #include "./sys/tree.h"
 #include <sys/stat.h>
@@ -486,8 +486,7 @@ mpage_cmp(struct mpage *a, struct mpage *b)
 	return 0;
 }
 
-static struct mpage *
-mpage_lookup(struct btree *bt, pgno_t pgno)
+static struct mpage * mpage_lookup(struct btree *bt, pgno_t pgno)
 {
 	struct mpage	 find, *mp;
 
@@ -498,6 +497,8 @@ mpage_lookup(struct btree *bt, pgno_t pgno)
 		/* Update LRU queue. Move page to the end. */
 		TAILQ_REMOVE(bt->lru_queue, mp, lru_next);
 		TAILQ_INSERT_TAIL(bt->lru_queue, mp, lru_next);
+	}else{
+		bt->stat.misses++;
 	}
 	return mp;
 }
@@ -650,8 +651,11 @@ static int btree_read_page(struct btree *bt, pgno_t pgno, struct page *page)
 
 int btree_sync(struct btree *bt)
 {
-	if (!F_ISSET(bt->flags, BT_NOSYNC))
+	if (!F_ISSET(bt->flags, BT_NOSYNC)){
+		bt->stat.fsyncs++;
 		return fsync(bt->fd);
+	}
+	
 	return 0;
 }
 
@@ -814,6 +818,7 @@ int btree_txn_commit(struct btree_txn *txn)
 
 		DPRINTF("commiting %u dirty pages", n);
 		rc = writev(bt->fd, iov, n);
+		bt->stat.writes+=n;
 		if (rc != (ssize_t)bt->head.psize*n) {
 			if (rc > 0)
 				DPRINTF("short write, filesystem full?");
@@ -1126,7 +1131,8 @@ struct btree * btree_open_fd(int fd, unsigned int flags)
 
 	DPRINTF("opened database version %u, pagesize %u",
 	    bt->head.version, bt->head.psize);
-	DPRINTF("timestamp: %s", ctime(&bt->meta.created_at));
+	const size_t created_at= bt->meta.created_at;
+	DPRINTF("timestamp: %s", ctime(&created_at));
 	DPRINTF("depth: %u", bt->meta.depth);
 	DPRINTF("entries: %llu", bt->meta.entries);
 	DPRINTF("revisions: %u", bt->meta.revisions);
@@ -3151,8 +3157,7 @@ btree_get_path(struct btree *bt)
 	return bt->path;
 }
 
-const struct btree_stat *
-btree_stat(struct btree *bt)
+const struct btree_stat * btree_stat(struct btree *bt)
 {
 	if (bt == NULL)
 		return NULL;
