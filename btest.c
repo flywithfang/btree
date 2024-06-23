@@ -100,11 +100,13 @@ int main(int argc, char **argv)
 		key.size = strlen(key.data);
 		data.data = argv[2];
 		data.size = strlen(data.data);
-		rc = btree_put(bt, &key, &data, 0);
+		struct btree_txn	* txn=btree_txn_begin(bt,0);
+		rc = btree_txn_put(bt, &key, &data, 0);
 		if (rc == BT_SUCCESS)
 			printf("OK\n");
 		else
 			printf("FAIL\n");
+		btree_txn_commit(txn);
 	}else	if (strcmp(argv[0], "putn") == 0) {
 		if (argc < 4)
 			errx(1, "missing arguments");
@@ -112,23 +114,21 @@ int main(int argc, char **argv)
 		const uint64_t st=get_cur_us();
 		struct btree_txn	* txn=btree_txn_begin(bt,0);
 		assert(txn);
-		char  buf[1024];
+		char  buf_key[1024];
+		char buf_val[1024];
 		for(int k=0;k<n;++k){
-			snprintf(buf, sizeof(buf),"%s_%d",argv[1],k);
+			snprintf(buf_key, sizeof(buf_key),"%s_%d",argv[1],k);
+			snprintf(buf_val, sizeof(buf_val),"%s_%d",argv[2],k);
 		//	printf("%s\n",buf);
-			key.data = buf;
+			key.data = buf_key;
 			key.size = strlen(key.data);
-			data.data = argv[2];
+			data.data = buf_val;
 			data.size = strlen(data.data);
 			assert(data.size);
 			//rc = btree_put(bt, &key, &data, 0);
-			rc = btree_txn_put(bt,txn,&key,&data,0);
+			rc = btree_txn_put(txn,&key,&data,0);
 			assert(rc==BT_SUCCESS);
-			/*if (rc == BT_SUCCESS)
-				printf("OK %s\n",buf);
-			else
-				printf("FAIL /%s\n",buf);
-				*/
+
 		}
 		btree_txn_commit(txn);
 		const uint64_t et=get_cur_us();
@@ -141,18 +141,42 @@ int main(int argc, char **argv)
 			errx(1, "missing argument");
 		key.data = argv[1];
 		key.size = strlen(key.data);
-		rc = btree_del(bt, &key, NULL);
+		struct btree_txn* const txn = btree_txn_begin(bt,1);
+		rc = btree_txn_del(txn, &key);
 		if (rc == BT_SUCCESS)
 			printf("OK\n");
 		else
 			printf("FAIL\n");
-	} else if (strcmp(argv[0], "get") == 0) {
+		btree_txn_commit(txn);
+	} 	 else if (strcmp(argv[0], "dels") == 0) {
+		if (argc < 2)
+			errx(1, "missing argument");
+		key.data = argv[1];
+		key.size = strlen(key.data);
+		maxkey.data = argv[2];
+		maxkey.size = strlen(maxkey.data);
+		struct btree_txn* const txn = btree_txn_begin(bt,0);
+		cursor = btree_txn_cursor_open(txn);
+		flags = BT_CURSOR;
+		while ((rc = btree_cursor_get(cursor, &key, NULL,flags)) == BT_SUCCESS) {
+			if ( btree_cmp(bt, &key, &maxkey) > 0)
+				break;
+			rc = btree_txn_del(txn, &key);
+			printf("del %s  %.*s\n", rc == BT_SUCCESS ? "OK":"FAIL",
+				(int)key.size, (char *)key.data);
+			flags = BT_NEXT;
+		}
+		btree_cursor_close(cursor);
+		btree_txn_commit(txn);
+	}
+	else if (strcmp(argv[0], "get") == 0) {
 		if (argc < 2)
 			errx(1, "missing arguments");
 		const uint64_t st=get_cur_us();
 		key.data = argv[1];
 		key.size = strlen(key.data);
-		rc = btree_get(bt, &key, &data);
+		struct btree_txn* const txn = btree_txn_begin(bt,1);
+		rc = btree_txn_get(txn, &key, &data);
 		const uint64_t et=get_cur_us();
 		printf("get %lu us\n", et-st);
 		
@@ -161,6 +185,8 @@ int main(int argc, char **argv)
 		} else {
 			printf("FAIL\n");
 		}
+		btree_txn_abort(txn);
+
 	} else if (strcmp(argv[0], "scan") == 0) {
 		if (argc > 1) {
 			key.data = argv[1];
@@ -171,17 +197,18 @@ int main(int argc, char **argv)
 			flags = BT_FIRST;
 		if (argc > 2) {
 			maxkey.data = argv[2];
-			maxkey.size = strlen(key.data);
+			maxkey.size = strlen(maxkey.data);
 		}
-
-		cursor = btree_cursor_open(bt);
+		struct btree_txn* const txn = btree_txn_begin(bt,1);
+		cursor = btree_txn_cursor_open(txn);
 		while ((rc = btree_cursor_get(cursor, &key, &data,flags)) == BT_SUCCESS) {
 			if (argc > 2 && btree_cmp(bt, &key, &maxkey) > 0)
 				break;
-			printf("OK %zi %.*s\n", key.size, (int)key.size, (char *)key.data);
+			printf("OK  %.*s %zi\n", (int)key.size, (char *)key.data, data.size);
 			flags = BT_NEXT;
 		}
 		btree_cursor_close(cursor);
+		btree_txn_abort(txn);
 	}else if (strcmp(argv[0], "scan2") == 0) {
 		if (argc > 1) {
 			key.data = argv[1];
@@ -192,12 +219,13 @@ int main(int argc, char **argv)
 			flags = BT_FIRST;
 		if (argc > 2) {
 			maxkey.data = argv[2];
-			maxkey.size = strlen(key.data);
+			maxkey.size = strlen(maxkey.data);
 		}
-
-		cursor = btree_cursor_open(bt);
+		struct btree_txn* const txn = btree_txn_begin(bt,1);
+		cursor = btree_txn_cursor_open(txn);
 		for(;;)
 		{	
+			sleep(1);
 			while ((rc = btree_cursor_get(cursor, &key, &data,flags)) == BT_SUCCESS) {
 				if (argc > 2 && btree_cmp(bt, &key, &maxkey) > 0)
 					break;
@@ -207,6 +235,7 @@ int main(int argc, char **argv)
 			}
 		}
 		btree_cursor_close(cursor);
+		btree_txn_abort(txn);
 	}  else if (strcmp(argv[0], "compact") == 0) {
 		const uint64_t st=get_cur_us();
 		if ((rc = btree_compact(bt)) != BT_SUCCESS)
@@ -216,7 +245,13 @@ int main(int argc, char **argv)
 	} else if (strcmp(argv[0], "revert") == 0) {
 		if ((rc = btree_revert(bt)) != BT_SUCCESS)
 			warn("revert");
-	} else
+	} else if (strcmp(argv[0], "print") == 0) {
+		if (argc < 2)
+			errx(1, "missing arguments");
+		const unsigned int page_no = atoi(argv[1]);
+		btree_dump_page(bt,page_no);
+	} 
+	else
 		errx(1, "%s: invalid command", argv[0]);
 	dump_stat(bt);
 	btree_close(bt);

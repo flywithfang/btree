@@ -80,7 +80,6 @@ typedef uint16_t	 indx_t;
 #define p_next_pgno	 b.pb_next_pgno
 struct page {				/* represents an on-disk page */
 	pgno_t		 pgno;		/* page number */
-
 	uint32_t	 flags;
 //layout
 	union page_bounds {
@@ -110,9 +109,9 @@ struct bt_head {				/* header page content */
 	uint32_t	 flags;
 	uint32_t	 psize;			/* page size */
 } __attribute__ ((__packed__));
-
-struct bt_meta {				/* meta (footer) page content */
 #define BT_TOMBSTONE	 0x01			/* file is replaced */
+struct bt_meta {				/* meta (footer) page content */
+
 	uint32_t	 flags;
 	pgno_t		 root;			/* page number of root page */
 	pgno_t		 prev_meta;		/* previous meta page number */
@@ -133,7 +132,10 @@ struct btkey {
 
 struct mpage {					/* an in-memory cached page */
 	RB_ENTRY(mpage)		 entry;		/* page cache entry */
-	SIMPLEQ_ENTRY(mpage)	 next;		/* queue of dirty pages */
+	//SIMPLEQ_ENTRY(mpage)	 next;		/* queue of dirty pages */
+	struct{
+		struct mpage *sqe_next;	/* next element */		
+	}next;	
 	TAILQ_ENTRY(mpage)	 lru_next;	/* LRU queue */
 	struct mpage		*parent;	/* NULL if root */
 	unsigned int		 parent_index;	/* keep track of node index */
@@ -144,7 +146,12 @@ struct mpage {					/* an in-memory cached page */
 	short			 dirty;		/* 1 if on dirty queue */
 };
 RB_HEAD(page_cache, mpage);
-SIMPLEQ_HEAD(dirty_queue, mpage);
+//SIMPLEQ_HEAD(dirty_queue, mpage);
+struct dirty_queue {								
+	struct mpage *sqh_first;	/* first element */			
+	struct mpage **sqh_last;	/* addr of last next element */		
+};
+
 TAILQ_HEAD(lru_queue, mpage);
 
 static int		 mpage_cmp(struct mpage *a, struct mpage *b);
@@ -155,7 +162,7 @@ static void		 mpage_del(struct btree *bt, struct mpage *mp);
 static void		 mpage_flush(struct btree *bt);
 static struct mpage	*mpage_copy(struct btree *bt, struct mpage *mp);
 static void		 mpage_prune(struct btree *bt);
-static void		 mpage_dirty(struct btree *bt, struct mpage *mp);
+static void		 mpage_dirty(struct btree_txn *txn, struct mpage *mp);
 static struct mpage	*mpage_touch(struct btree *bt, struct mpage *mp);
 
 RB_PROTOTYPE(page_cache, mpage, entry, mpage_cmp);
@@ -194,13 +201,11 @@ struct cursor {
 #define n_dsize		 p.np_dsize
 #define F_BIGDATA	 0x01			/* data put on overflow page */
 struct node {
-
 	union {
 		pgno_t		 np_pgno;	/* child page number */
 		uint32_t	 np_dsize;	/* leaf data size */
 	}		 p;
 	uint16_t	 ksize;			/* key size */
-
 	uint8_t		 flags;
 	char		 data[1];
 } __packed;
@@ -226,9 +231,9 @@ struct btree {
 	struct page_cache	*page_cache;
 	struct lru_queue	*lru_queue;
 	struct btree_txn	*txn;		/* current write transaction */
-	int			 ref;		/* increased by cursors & txn */
-	struct btree_stat	 stat;
-	off_t			 size;		/* current file size */
+	int			 		ref;		/* increased by cursors & txn */
+	struct btree_stat	stat;
+	off_t			 	size;		/* current file size */
 };
 
 #define NODESIZE	 offsetof(struct node, data)
@@ -248,11 +253,11 @@ struct btree {
 static int		 btree_read_page(struct btree *bt, pgno_t pgno,
 			    struct page *page);
 static struct mpage	*btree_get_mpage(struct btree *bt, pgno_t pgno);
-static int		 btree_search_page_root(struct btree *bt,
+static int		 btree_search_leaf_page_from_root(struct btree *bt,
 			    struct mpage *root, struct btval *key,
 			    struct cursor *cursor, int modify,
 			    struct mpage **mpp);
-static int		 btree_search_page(struct btree *bt,
+static int		 btree_search_leaf_page(struct btree *bt,
 			    struct btree_txn *txn, struct btval *key,
 			    struct cursor *cursor, int modify,
 			    struct mpage **mpp);
@@ -265,13 +270,12 @@ static int		 btree_write_meta(struct btree *bt, pgno_t root,
 			    unsigned int flags);
 static void		 btree_ref(struct btree *bt);
 
-static struct node	*btree_search_node(struct btree *bt, struct mpage *mp,
+static struct node	*btree_search_in_leaf_page(struct btree *bt, struct mpage *mp,
 			    struct btval *key, int *exactp, unsigned int *kip);
 static int		 btree_add_node(struct btree *bt, struct mpage *mp,
 			    indx_t indx, struct btval *key, struct btval *data,
 			    pgno_t pgno, uint8_t flags);
-static void		 btree_del_node(struct mpage *mp,
-			    indx_t indx);
+static void		 btree_del_node(struct mpage *mp,indx_t indx);
 static int		 btree_read_data(struct btree *bt, struct mpage *mp,
 			    struct node *leaf, struct btval *data);
 
@@ -383,8 +387,7 @@ btree_cmp(struct btree *bt, const struct btval *a, const struct btval *b)
 
 }
 
-static void
-common_prefix(struct btree *bt, struct btkey *min, struct btkey *max,
+static void common_prefix(struct btree *bt, struct btkey *min, struct btkey *max,
     struct btkey *pfx)
 {
 	size_t		 n = 0;
@@ -429,14 +432,12 @@ common_prefix(struct btree *bt, struct btkey *min, struct btkey *max,
 	}
 }
 
-static void
-remove_prefix(struct btree *bt, struct btval *key, size_t pfxlen)
+static void remove_prefix(struct btree *bt, struct btval *key, size_t pfxlen)
 {
 	if (pfxlen == 0 || bt->cmp != NULL)
 		return;
 
-	DPRINTF("removing %zu bytes of prefix from key [%.*s]", pfxlen,
-	    (int)key->size, (char *)key->data);
+	DPRINTF("removing %zu bytes of prefix from key [%.*s]", pfxlen, (int)key->size, (char *)key->data);
 	assert(pfxlen <= key->size);
 	key->size -= pfxlen;
 	if (!F_ISSET(bt->flags, BT_REVERSEKEY))
@@ -455,8 +456,7 @@ expand_prefix(struct btree *bt, struct mpage *mp, indx_t indx,
 	    NODEKEY(node), node->ksize, expkey->str, &expkey->len);
 }
 
-static int bt_cmp(struct btree *bt, const struct btval *key1, const struct btval *key2,
-    struct btkey *pfx)
+static int bt_cmp(struct btree *bt, const struct btval *key1, const struct btval *key2,struct btkey *pfx)
 {
 	if (F_ISSET(bt->flags, BT_REVERSEKEY))
 		return memnrcmp(key1->data+ pfx->len, key1->size - pfx->len,key2->data, key2->size);
@@ -464,8 +464,7 @@ static int bt_cmp(struct btree *bt, const struct btval *key1, const struct btval
 		return memncmp((char *)key1->data + pfx->len, key1->size - pfx->len,key2->data, key2->size);
 }
 
-void
-btval_reset(struct btval *btv)
+void btval_reset(struct btval *btv)
 {
 	if (btv) {
 		if (btv->mp)
@@ -510,8 +509,7 @@ static void mpage_add(struct btree *bt, struct mpage *mp)
 	TAILQ_INSERT_TAIL(bt->lru_queue, mp, lru_next);
 }
 
-static void
-mpage_free(struct mpage *mp)
+static void mpage_free(struct mpage *mp)
 {
 	if (mp != NULL) {
 		free(mp->page);
@@ -519,8 +517,7 @@ mpage_free(struct mpage *mp)
 	}
 }
 
-static void
-mpage_del(struct btree *bt, struct mpage *mp)
+static void mpage_del(struct btree *bt, struct mpage *mp)
 {
 	assert(RB_REMOVE(page_cache, bt->page_cache, mp) == mp);
 	assert(bt->stat.cache_size > 0);
@@ -528,8 +525,7 @@ mpage_del(struct btree *bt, struct mpage *mp)
 	TAILQ_REMOVE(bt->lru_queue, mp, lru_next);
 }
 
-static void
-mpage_flush(struct btree *bt)
+static void mpage_flush(struct btree *bt)
 {
 	struct mpage	*mp;
 
@@ -539,8 +535,7 @@ mpage_flush(struct btree *bt)
 	}
 }
 
-static struct mpage *
-mpage_copy(struct btree *bt, struct mpage *mp)
+static struct mpage * mpage_copy(struct btree *bt, struct mpage *mp)
 {
 	struct mpage	*copy;
 
@@ -580,28 +575,31 @@ static void mpage_prune(struct btree *bt)
 
 /* Mark a page as dirty and push it on the dirty queue.
  */
-static void mpage_dirty(struct btree *bt, struct mpage *mp)
+static void mpage_dirty(struct btree_txn* txn, struct mpage *mp)
 {
-	assert(bt != NULL);
-	assert(bt->txn != NULL);
+	assert(txn->bt != NULL);
+	assert(txn != NULL);
 
 	if (!mp->dirty) {
 		mp->dirty = 1;
-		SIMPLEQ_INSERT_TAIL(bt->txn->dirty_queue, mp, next);
+		//SIMPLEQ_INSERT_TAIL(bt->txn->dirty_queue, mp, next);
+		struct dirty_queue * head = txn->dirty_queue;
+		mp->next.sqe_next = NULL;					
+		*(head)->sqh_last = mp;					
+		(head)->sqh_last = &mp->next.sqe_next;			
 	}
 }
 
 /* Touch a page: make it dirty and re-insert into tree with updated pgno.
  */
-static struct mpage *
-mpage_touch(struct btree *bt, struct mpage *mp)
+static struct mpage * mpage_touch(struct btree *bt, struct mpage *mp)
 {
 	assert(bt != NULL);
 	assert(bt->txn != NULL);
 	assert(mp != NULL);
 
 	if (!mp->dirty) {
-		DPRINTF("touching page %u -> %u", mp->pgno, bt->txn->next_pgno);
+		DPRINTF("touching page %u -> %u mp->ref=%d", mp->pgno, bt->txn->next_pgno, mp->ref);
 		if (mp->ref == 0)
 			mpage_del(bt, mp);
 		else {
@@ -609,13 +607,17 @@ mpage_touch(struct btree *bt, struct mpage *mp)
 				return NULL;
 		}
 		mp->pgno = mp->page->pgno = bt->txn->next_pgno++;
-		mpage_dirty(bt, mp);
+		mpage_dirty(bt->txn, mp);
 		mpage_add(bt, mp);
 
 		/* Update the page number to new touched page. */
-		if (mp->parent != NULL)
-			NODEPGNO(NODEPTR(mp->parent,
-			    mp->parent_index)) = mp->pgno;
+		if (mp->parent != NULL){
+				assert(mp->parent->dirty==1);
+				assert( (mp->parent->page->flags&P_BRANCH)!=0);
+				struct node * p_node= (struct node*)((char*)mp->parent->page+ mp->parent->page->ptrs[mp->parent_index]);
+				p_node->p.np_pgno=mp->pgno;
+				//NODEPGNO(NODEPTR(mp->parent,mp->parent_index)) = mp->pgno;
+			}
 	}
 
 	return mp;
@@ -643,8 +645,9 @@ static int btree_read_page(struct btree *bt, pgno_t pgno, struct page *page)
 		errno = EINVAL;
 		return BT_FAIL;
 	}
-
-	DPRINTF("page %u has flags 0x%X", pgno, page->flags);
+	const char * tag= page->flags == P_BRANCH? "branch" : 
+	page->flags==P_LEAF ? "leaf" : ( page->flags == P_META  ? "meta": "other");
+	DPRINTF("page %u has flags %s 0x%X", pgno,tag,page->flags);
 
 	return BT_SUCCESS;
 }
@@ -682,7 +685,11 @@ struct btree_txn * btree_txn_begin(struct btree *bt, int rdonly)
 			free(txn);
 			return NULL;
 		}
-		SIMPLEQ_INIT(txn->dirty_queue);
+		//SIMPLEQ_INIT(txn->dirty_queue);
+		{
+				txn->dirty_queue->sqh_first = NULL;					
+				txn->dirty_queue->sqh_last = &txn->dirty_queue->sqh_first;				
+		}
 
 		DPRINTF("taking write lock on txn %p", txn);
 		if (flock(bt->fd, LOCK_EX | LOCK_NB) != 0) {
@@ -709,8 +716,7 @@ struct btree_txn * btree_txn_begin(struct btree *bt, int rdonly)
 	return txn;
 }
 
-void
-btree_txn_abort(struct btree_txn *txn)
+void btree_txn_abort(struct btree_txn *txn)
 {
 	struct mpage	*mp;
 	struct btree	*bt;
@@ -751,13 +757,13 @@ int btree_txn_commit(struct btree_txn *txn)
 	ssize_t		 rc;
 	off_t		 size;
 	struct mpage	*mp;
-	struct btree	*bt;
+
 	struct iovec	 iov[BT_COMMIT_PAGES];
 
 	assert(txn != NULL);
 	assert(txn->bt != NULL);
 
-	bt = txn->bt;
+	struct btree	*const bt = txn->bt;
 
 	if (F_ISSET(txn->flags, BT_TXN_RDONLY)) {
 		DPRINTF("attempt to commit read-only transaction");
@@ -1015,7 +1021,7 @@ static int btree_is_meta_page(struct page *p)
 static int btree_read_meta(struct btree *bt, pgno_t *p_next)
 {
 	struct mpage	*mp;
-	struct bt_meta	*meta;
+	
 	pgno_t		 meta_pgno, next_pgno;
 	off_t		 size;
 
@@ -1071,8 +1077,8 @@ static int btree_read_meta(struct btree *bt, pgno_t *p_next)
 		if ((mp = btree_get_mpage(bt, meta_pgno)) == NULL)
 			break;
 		if (btree_is_meta_page(mp->page)) {
-			meta = METADATA(mp->page);
-			DPRINTF("flags = 0x%x", meta->flags);
+			const struct bt_meta	* const meta = METADATA(mp->page);
+			//DPRINTF("flags = 0x%x", meta->flags);
 			if (F_ISSET(meta->flags, BT_TOMBSTONE)) {
 				DPRINTF("file is dead");
 				errno = ESTALE;
@@ -1175,15 +1181,13 @@ btree_open(const char *path, unsigned int flags, mode_t mode)
 	return bt;
 }
 
-static void
-btree_ref(struct btree *bt)
+static void btree_ref(struct btree *bt)
 {
 	bt->ref++;
 	DPRINTF("ref is now %d on btree %p", bt->ref, bt);
 }
 
-void
-btree_close(struct btree *bt)
+void btree_close(struct btree *bt)
 {
 	if (bt == NULL)
 		return;
@@ -1200,15 +1204,9 @@ btree_close(struct btree *bt)
 		DPRINTF("ref is now %d on btree %p", bt->ref, bt);
 }
 
-/* Search for key within a leaf page, using binary search.
- * Returns the smallest entry larger or equal to the key.
- * If exactp is non-null, stores whether the found entry was an exact match
- * in *exactp (1 or 0).
- * If kip is non-null, stores the index of the found entry in *kip.
- * If no entry larger of equal to the key is found, returns NULL.
- */
-static struct node * btree_search_node(struct btree *bt, struct mpage *mp, struct btval *key,int *exactp, unsigned int *kip)
+static int btree_search_in_branch_page(struct btree *bt, struct mpage *mp, struct btval *key, unsigned int *kip)
 {
+	assert(IS_BRANCH(mp));
 	unsigned int	 i = 0;
 	int		 low, high;
 	int		 rc = 0;
@@ -1216,15 +1214,13 @@ static struct node * btree_search_node(struct btree *bt, struct mpage *mp, struc
 	struct btval	 nodekey;
 
 	DPRINTF("searching %lu keys in %s page %u with prefix [%.*s]",
-	    NUMKEYS(mp),
-	    IS_LEAF(mp) ? "leaf" : "branch",
-	    mp->pgno, (int)mp->prefix.len, (char *)mp->prefix.str);
+	    NUMKEYS(mp),"branch", mp->pgno, (int)mp->prefix.len, (char *)mp->prefix.str);
 
 	assert(NUMKEYS(mp) > 0);
 
 	memset(&nodekey, 0, sizeof(nodekey));
-
-	low = IS_LEAF(mp) ? 0 : 1;
+	// k0 p0 k1 p1 k2 p2 k3 p3 
+	low =  1;
 	high = ((mp->page->lower - PAGEHDRSZ) >> 1) -1; //NUMKEYS(mp) - 1;
 	while (low <= high) {
 		i = (low + high) >> 1;
@@ -1238,10 +1234,7 @@ static struct node * btree_search_node(struct btree *bt, struct mpage *mp, struc
 		else
 			rc = bt_cmp(bt, key, &nodekey, &mp->prefix);
 
-		if (IS_LEAF(mp))
-			DPRINTF("found leaf index %u [%.*s]",i, (int)nodekey.size, (char *)nodekey.data);
-		else
-			DPRINTF("found branch index %u [%.*s -> %u]",i, (int)node->ksize, (char *)NODEKEY(node),
+		DPRINTF("checking branch key: %u [%.*s -> %u]",i, (int)node->ksize, (char *)NODEKEY(node),
 			    node->n_pgno);
 
 		if (rc == 0)
@@ -1252,8 +1245,66 @@ static struct node * btree_search_node(struct btree *bt, struct mpage *mp, struc
 			high = i - 1;
 	}
 /// a b c d
-	if (rc > 0) {	/* Found entry is less than the key. */
+// 0  1  2  3 
+	if (kip)	/* Store the key index if requested. */
+		*kip = i;
+		// i : 0 - n-1
+	return rc; //NODEPTR(mp, i);
+}
+
+/* Search for key within a leaf page, using binary search.
+ * Returns the smallest entry larger or equal to the key.
+ * If exactp is non-null, stores whether the found entry was an exact match
+ * in *exactp (1 or 0).
+ * If kip is non-null, stores the index of the found entry in *kip.
+ * If no entry larger of equal to the key is found, returns NULL.
+ */
+static struct node * btree_search_in_leaf_page(struct btree *bt, struct mpage *mp, struct btval *key,int *exactp, unsigned int *kip)
+{
+	assert(IS_LEAF(mp));
+	unsigned int	 i = 0;
+	int		 low, high;
+	int		 rc = 0;
+	struct node	*node;
+	struct btval	 nodekey;
+
+	DPRINTF("searching %lu keys in %s page %u with prefix [%.*s]",
+	    NUMKEYS(mp), "leaf", mp->pgno, (int)mp->prefix.len, (char *)mp->prefix.str);
+
+	assert(NUMKEYS(mp) > 0);
+
+	memset(&nodekey, 0, sizeof(nodekey));
+	// k0 p0 k1 p1 k2 p2 k3 p3 
+	low = 0;
+	high = ((mp->page->lower - PAGEHDRSZ) >> 1) -1; //NUMKEYS(mp) - 1;
+	while (low <= high) {
+		i = (low + high) >> 1;
+		node = (struct node *)((char *)(mp->page) + mp->page->ptrs[i]);//NODEPTR(mp, i);
+
+		nodekey.size = node->ksize;
+		nodekey.data = (void *)(node->data);//NODEKEY(node);
+
+		if (bt->cmp)
+			rc = bt->cmp(key, &nodekey);
+		else
+			rc = bt_cmp(bt, key, &nodekey, &mp->prefix);
+
+		DPRINTF("comparing leaf key index %u [%.*s]",i, (int)nodekey.size, (char *)nodekey.data);
+
+		if (rc == 0)
+			break;
+		if (rc > 0)
+			low = i + 1;
+		else
+			high = i - 1;
+	}
+/// a b c d
+	if (rc > 0) {
+		//high low
+		/* Found entry is less than the key. */
 		i++;	/* Skip to get the smallest entry larger than key. */
+		assert(i==low);
+		
 		if (i >= NUMKEYS(mp))
 			/* There is no entry larger or equal to the key. */
 			return NULL;
@@ -1262,7 +1313,7 @@ static struct node * btree_search_node(struct btree *bt, struct mpage *mp, struc
 		*exactp = (rc == 0);
 	if (kip)	/* Store the key index if requested. */
 		*kip = i;
-
+		// i : 0 - n-1
 	return (struct node *)((char *)(mp->page) + mp->page->ptrs[i]); //NODEPTR(mp, i);
 }
 
@@ -1338,8 +1389,7 @@ concat_prefix(struct btree *bt, char *s1, size_t n1, char *s2, size_t n2,
 	*cn = n1 + n2;
 }
 
-static void
-find_common_prefix(struct btree *bt, struct mpage *mp)
+static void find_common_prefix(struct btree *bt, struct mpage *mp)
 {
 	indx_t			 lbound = 0, ubound = 0;
 	struct mpage		*lp, *up;
@@ -1379,7 +1429,7 @@ find_common_prefix(struct btree *bt, struct mpage *mp)
 	    (int)mp->prefix.len, mp->prefix.str, mp->prefix.len, mp->pgno);
 }
 
-static int btree_search_page_root(struct btree *bt, struct mpage *root, struct btval *key,
+static int btree_search_leaf_page_from_root(struct btree *bt, struct mpage *root, struct btval *key,
     struct cursor *cursor, int modify, struct mpage **mpp)
 {
 	struct mpage	*mp, *parent;
@@ -1394,23 +1444,21 @@ static int btree_search_page_root(struct btree *bt, struct mpage *root, struct b
 
 		DPRINTF("branch page %u has %lu keys", mp->pgno, NUMKEYS(mp));
 		assert(NUMKEYS(mp) > 1);
-		DPRINTF("found index 0 to page %u", NODEPGNO(NODEPTR(mp, 0)));
+		//DPRINTF("found index 0 to page %u", NODEPGNO(NODEPTR(mp, 0)));
 
 		if (key == NULL)	/* Initialize cursor to first page. */
 			i = 0;
 		else {
-			int	 exact;
-			node = btree_search_node(bt, mp, key, &exact, &i);
-			if (node == NULL)
-				i = NUMKEYS(mp) - 1;
-			else if (!exact) {
-				assert(i > 0);
-				i--;
+			//k0 p0 k1 p1 k2 p2 k3 p3 
+			const int rc = btree_search_in_branch_page(bt, mp, key, &i);
+			if(rc<0){
+				assert(i>0);
+				--i;
 			}
 		}
 
-		if (key)
-			DPRINTF("following index %u for key %.*s",i, (int)key->size, (char *)key->data);
+		//if (key)
+		//	DPRINTF("following index %u for key %.*s",i, (int)key->size, (char *)key->data);
 		assert((int)i >= 0 && i < NUMKEYS(mp));
 		node = NODEPTR(mp, i);
 
@@ -1422,6 +1470,7 @@ static int btree_search_page_root(struct btree *bt, struct mpage *root, struct b
 			return BT_FAIL;
 		mp->parent = parent;
 		mp->parent_index = i;
+		///abc -> abcd
 		find_common_prefix(bt, mp);
 
 		if (cursor && cursor_push_page(cursor, mp) == NULL)
@@ -1437,8 +1486,7 @@ static int btree_search_page_root(struct btree *bt, struct mpage *root, struct b
 		return BT_FAIL;
 	}
 
-	DPRINTF("found leaf page %u for key %.*s", mp->pgno,
-	    key ? (int)key->size : 0, key ? (char *)key->data : NULL);
+	//DPRINTF("found leaf page %u for key %.*s", mp->pgno,key ? (int)key->size : 0, key ? (char *)key->data : NULL);
 
 	*mpp = mp;
 	return BT_SUCCESS;
@@ -1450,13 +1498,12 @@ static int btree_search_page_root(struct btree *bt, struct mpage *root, struct b
  * If cursor is non-null, pushes parent pages on the cursor stack.
  * If modify is true, visited pages are updated with new page numbers.
  */
-static int btree_search_page(struct btree *bt, struct btree_txn *txn, struct btval *key,
+static int btree_search_leaf_page(struct btree *bt, struct btree_txn *txn, struct btval *key,
     struct cursor *cursor, int modify, struct mpage **mpp)
 {
 	int		 rc;
 	pgno_t		 root;
-	struct mpage	*mp;
-
+	
 	/* Can't modify pages outside a transaction. */
 	if (txn == NULL && modify) {
 		errno = EINVAL;
@@ -1467,11 +1514,8 @@ static int btree_search_page(struct btree *bt, struct btree_txn *txn, struct btv
          * use the root page from the transaction, otherwise read the last
          * committed root page.
 	 */
-	if (txn == NULL) {
-		if ((rc = btree_read_meta(bt, NULL)) != BT_SUCCESS)
-			return rc;
-		root = bt->meta.root;
-	} else if (F_ISSET(txn->flags, BT_TXN_ERROR)) {
+	assert(txn);
+	if (F_ISSET(txn->flags, BT_TXN_ERROR)) {
 		DPRINTF("transaction has failed, must abort");
 		errno = EINVAL;
 		return BT_FAIL;
@@ -1483,22 +1527,23 @@ static int btree_search_page(struct btree *bt, struct btree_txn *txn, struct btv
 		errno = ENOENT;
 		return BT_FAIL;
 	}
+	struct mpage	*root_page;
 
-	if ((mp = btree_get_mpage(bt, root)) == NULL)
+	if ((root_page = btree_get_mpage(bt, root)) == NULL)
 		return BT_FAIL;
 
-	DPRINTF("root page has flags 0x%X", mp->page->flags);
+	//DPRINTF("root page has flags 0x%X", mp->page->flags);
 
-	assert(mp->parent == NULL);
-	assert(mp->prefix.len == 0);
+	assert(root_page->parent == NULL);
+	assert(root_page->prefix.len == 0);
 
-	if (modify && !mp->dirty) {
-		if ((mp = mpage_touch(bt, mp)) == NULL)
+	if (modify && !root_page->dirty) {
+		if ((root_page = mpage_touch(bt, root_page)) == NULL)
 			return BT_FAIL;
-		txn->root = mp->pgno;
+		txn->root = root_page->pgno;
 	}
 
-	return btree_search_page_root(bt, mp, key, cursor, modify, mpp);
+	return btree_search_leaf_page_from_root(bt, root_page, key, cursor, modify, mpp);
 }
 
 static int btree_read_data(struct btree *bt, struct mpage *mp, struct node *leaf,struct btval *data)
@@ -1547,7 +1592,7 @@ static int btree_read_data(struct btree *bt, struct mpage *mp, struct node *leaf
 		    !F_ISSET(omp->page->flags, P_OVERFLOW)) {
 			DPRINTF("read overflow page %u failed", pgno);
 			free(data->data);
-			mpage_free(omp);
+			mpage_del(bt,omp);
 			return BT_FAIL;
 		}
 		psz = data->size - sz;
@@ -1561,39 +1606,26 @@ static int btree_read_data(struct btree *bt, struct mpage *mp, struct node *leaf
 	return BT_SUCCESS;
 }
 
-int
-btree_txn_get(struct btree *bt, struct btree_txn *txn,struct btval *key, struct btval *data)
+int btree_txn_get( struct btree_txn *txn,struct btval *key, struct btval *data)
 {
 	int		 rc, exact;
 	struct node	*leaf;
 	struct mpage	*mp;
-
+	assert(txn);
 	assert(key);
 	assert(data);
 	DPRINTF("===> get key [%.*s]", (int)key->size, (char *)key->data);
-
-	if (bt != NULL && txn != NULL && bt != txn->bt) {
-		errno = EINVAL;
-		return BT_FAIL;
-	}
-
-	if (bt == NULL) {
-		if (txn == NULL) {
-			errno = EINVAL;
-			return BT_FAIL;
-		}
-		bt = txn->bt;
-	}
+	struct btree* const bt=txn->bt;
 
 	if (key->size == 0 || key->size > MAXKEYSIZE) {
 		errno = EINVAL;
 		return BT_FAIL;
 	}
 
-	if ((rc = btree_search_page(bt, txn, key, NULL, 0, &mp)) != BT_SUCCESS)
+	if ((rc = btree_search_leaf_page(bt, txn, key, NULL, 0, &mp)) != BT_SUCCESS)
 		return rc;
 
-	leaf = btree_search_node(bt, mp, key, &exact, NULL);
+	leaf = btree_search_in_leaf_page(bt, mp, key, &exact, NULL);
 	if (leaf && exact)
 		rc = btree_read_data(bt, mp, leaf, data);
 	else {
@@ -1604,7 +1636,9 @@ btree_txn_get(struct btree *bt, struct btree_txn *txn,struct btval *key, struct 
 	mpage_prune(bt);
 	return rc;
 }
-
+static inline print_cursor(const struct ppage*top){
+	DPRINTF("cursor: page:%u,ki:%u/%u", top->mpage->page->pgno,top->ki,NUMKEYS(top->mpage)-1);
+}
 static int btree_sibling(struct cursor *cursor, int move_right)
 {
 	int		 rc;
@@ -1620,13 +1654,12 @@ static int btree_sibling(struct cursor *cursor, int move_right)
 		return BT_FAIL;			/* root has no siblings */
 	}
 
-	DPRINTF("parent page is page %u, index %u",parent->mpage->pgno, parent->ki);
+	print_cursor(parent);
 
 	cursor_pop_page(cursor);
-	if (move_right ? (parent->ki + 1 >= NUMKEYS(parent->mpage))
-		       : (parent->ki == 0)) {
-		DPRINTF("no more keys left, moving to %s sibling",
-		    move_right ? "right" : "left");
+
+	if (move_right ? (parent->ki + 1 >= NUMKEYS(parent->mpage)) : (parent->ki == 0)) {
+		DPRINTF("cursor: moving to %s cousin page", move_right ? "right" : "left");
 		if ((rc = btree_sibling(cursor, move_right)) != BT_SUCCESS)
 			return rc;
 		parent = CURSOR_TOP(cursor);
@@ -1635,7 +1668,7 @@ static int btree_sibling(struct cursor *cursor, int move_right)
 			parent->ki++;
 		else
 			parent->ki--;
-		DPRINTF("just moving to %s index key %u", move_right ? "right" : "left", parent->ki);
+		DPRINTF("cursor: moving to %s sibling index key %u", move_right ? "right" : "left", parent->ki);
 	}
 	assert(IS_BRANCH(parent->mpage));
 
@@ -1680,12 +1713,8 @@ bt_set_key(struct btree *bt, struct mpage *mp, struct node *node,
 	return 0;
 }
 
-static int
-btree_cursor_next(struct cursor *cursor, struct btval *key, struct btval *data)
+static int btree_cursor_next(struct cursor *cursor, struct btval *key, struct btval *data)
 {
-	struct ppage	*top;
-	struct mpage	*mp;
-	struct node	*leaf;
 
 	if (cursor->eof) {
 		errno = ENOENT;
@@ -1694,44 +1723,40 @@ btree_cursor_next(struct cursor *cursor, struct btval *key, struct btval *data)
 
 	assert(cursor->initialized);
 
-	top = SLIST_FIRST(&cursor->stack);//CURSOR_TOP(cursor);
-	mp = top->mpage;
+	struct ppage	* top = SLIST_FIRST(&cursor->stack);//CURSOR_TOP(cursor);
 
-	DPRINTF("cursor_next: top page is %u in cursor %p", mp->pgno, cursor);
+	print_cursor(top);
 
-	if (top->ki + 1 >= NUMKEYS(mp)) {
-		DPRINTF("=====> move to next sibling page");
+	if (top->ki + 1 >= NUMKEYS(top->mpage)) {
+		//DPRINTF("=====> move to next sibling page");
 		if (btree_sibling(cursor, 1) != BT_SUCCESS) {
 			cursor->eof = 1;
+			DPRINTF("cursor: eof");
 			return BT_FAIL;
 		}
 		top = CURSOR_TOP(cursor);
-		mp = top->mpage;
-		DPRINTF("next page is %u, key index %u", mp->pgno, top->ki);
+		print_cursor(top);
 	} else
 		top->ki++;
 
-	DPRINTF("==> cursor points to page %u with %lu keys, key index %u",
-	    mp->pgno, NUMKEYS(mp), top->ki);
+	print_cursor(top);
 
-	assert(IS_LEAF(mp));
-	leaf = NODEPTR(mp, top->ki);
+	assert(IS_LEAF(top->mpage));
+	struct node	*const leaf = NODEPTR(top->mpage, top->ki);
 
-	if (data && btree_read_data(cursor->bt, mp, leaf, data) != BT_SUCCESS)
+	if (data && btree_read_data(cursor->bt, top->mpage, leaf, data) != BT_SUCCESS)
 		return BT_FAIL;
 
-	if (bt_set_key(cursor->bt, mp, leaf, key) != 0)
+	if (bt_set_key(cursor->bt, top->mpage, leaf, key) != 0)
 		return BT_FAIL;
 
 	return BT_SUCCESS;
 }
 
-static int
-btree_cursor_set(struct cursor *cursor, struct btval *key, struct btval *data,
-    int *exactp)
+static int btree_cursor_set(struct cursor *cursor, struct btval *key, struct btval *data,int *exactp)
 {
 	int		 rc;
-	struct node	*leaf;
+	
 	struct mpage	*mp;
 	struct ppage	*top;
 
@@ -1739,13 +1764,13 @@ btree_cursor_set(struct cursor *cursor, struct btval *key, struct btval *data,
 	assert(key);
 	assert(key->size > 0);
 
-	rc = btree_search_page(cursor->bt, cursor->txn, key, cursor, 0, &mp);
+	rc = btree_search_leaf_page(cursor->bt, cursor->txn, key, cursor, 0, &mp);
 	if (rc != BT_SUCCESS)
 		return rc;
 	assert(IS_LEAF(mp));
 
 	top = CURSOR_TOP(cursor);
-	leaf = btree_search_node(cursor->bt, mp, key, exactp, &top->ki);
+	struct node	*leaf = btree_search_in_leaf_page(cursor->bt, mp, key, exactp, &top->ki);
 	if (exactp != NULL && !*exactp) {
 		/* BT_CURSOR_EXACT specified and not an exact match. */
 		errno = ENOENT;
@@ -1777,14 +1802,13 @@ btree_cursor_set(struct cursor *cursor, struct btval *key, struct btval *data,
 	return BT_SUCCESS;
 }
 
-static int
-btree_cursor_first(struct cursor *cursor, struct btval *key, struct btval *data)
+static int btree_cursor_first(struct cursor *cursor, struct btval *key, struct btval *data)
 {
 	int		 rc;
 	struct mpage	*mp;
 	struct node	*leaf;
 
-	rc = btree_search_page(cursor->bt, cursor->txn, NULL, cursor, 0, &mp);
+	rc = btree_search_leaf_page(cursor->bt, cursor->txn, NULL, cursor, 0, &mp);
 	if (rc != BT_SUCCESS)
 		return rc;
 	assert(IS_LEAF(mp));
@@ -1851,8 +1875,7 @@ static struct mpage * btree_new_page(struct btree *bt, uint32_t flags)
 	assert(bt != NULL);
 	assert(bt->txn != NULL);
 
-	DPRINTF("allocating new mpage %u, page size %u",
-	    bt->txn->next_pgno, bt->head.psize);
+	DPRINTF("allocating new mpage %u, page no %u",bt->txn->next_pgno, bt->txn->next_pgno);
 	if ((mp = calloc(1, sizeof(*mp))) == NULL)
 		return NULL;
 	if ((mp->page = malloc(bt->head.psize)) == NULL) {
@@ -1872,14 +1895,14 @@ static struct mpage * btree_new_page(struct btree *bt, uint32_t flags)
 		bt->meta.overflow_pages++;
 
 	mpage_add(bt, mp);
-	mpage_dirty(bt, mp);
+	mpage_dirty(bt->txn, mp);
 
 	return mp;
 }
 
 static size_t bt_leaf_size(struct btree *bt, struct btval *key, struct btval *data)
 {
-	size_t		 sz =  NODESIZE + key->size + data->size;//LEAFSIZE(key, data);
+	size_t		 sz =  offsetof(struct node,data) + key->size + data->size;//LEAFSIZE(key, data);
 	if (data->size >= bt->head.psize / BT_MINKEYS) {
 		/* put on overflow page */
 		sz -= data->size - sizeof(pgno_t);
@@ -1888,8 +1911,7 @@ static size_t bt_leaf_size(struct btree *bt, struct btval *key, struct btval *da
 	return sz + sizeof(indx_t); // key_size, data_size, offset_size
 }
 
-static size_t
-bt_branch_size(struct btree *bt, struct btval *key)
+static size_t bt_branch_size(struct btree *bt, struct btval *key)
 {
 	size_t		 sz;
 
@@ -1903,17 +1925,16 @@ bt_branch_size(struct btree *bt, struct btval *key)
 	return sz + sizeof(indx_t);
 }
 
-static int
-btree_write_overflow_data(struct btree *bt, struct page *p, struct btval *data)
+static int btree_write_overflow_data(struct btree *bt, struct page *p, struct btval *data)
 {
-	size_t		 done = 0;
+	
 	size_t		 sz;
-	size_t		 max;
+	
 	pgno_t		*linkp;			/* linked page stored here */
 	struct mpage	*next = NULL;
 
-	max = bt->head.psize - PAGEHDRSZ;
-
+	const size_t	max = bt->head.psize - PAGEHDRSZ;
+	size_t		 done = 0;
 	while (done < data->size) {
 		if (next != NULL)
 			p = next->page;
@@ -1967,8 +1988,7 @@ static int btree_add_node(struct btree *bt, struct mpage *mp, indx_t indx, struc
 			node_size -= data->size - sizeof(pgno_t);
 		} else if (data->size >= bt->head.psize / BT_MINKEYS) {
 			/* Put data on overflow page. */
-			DPRINTF("data size is %zu, put on overflow page",
-			    data->size);
+			DPRINTF("data size is %zu, put on overflow page",data->size);
 			node_size -= data->size - sizeof(pgno_t);
 			if ((ofp = btree_new_page(bt, P_OVERFLOW)) == NULL)
 				return BT_FAIL;
@@ -1976,16 +1996,15 @@ static int btree_add_node(struct btree *bt, struct mpage *mp, indx_t indx, struc
 			flags |= F_BIGDATA;
 		}
 	}
-
-	if (node_size + sizeof(indx_t) > SIZELEFT(mp)) {
-		DPRINTF("not enough room in page %u, got %lu ptrs",
-		    mp->pgno, NUMKEYS(mp));
+	const indx_t left_size=  (indx_t)(mp->page->upper - mp->page->lower);
+	if (node_size + sizeof(indx_t) > left_size) {
+		DPRINTF("not enough room in page %u, got %lu ptrs",mp->pgno, NUMKEYS(mp));
 		DPRINTF("upper - lower = %u - %u = %u", p->upper, p->lower,
 		    p->upper - p->lower);
 		DPRINTF("node size = %zu", node_size);
 		return BT_FAIL;
 	}
-
+	//abcde
 	/* Move higher pointers up one slot. */
 	for (i = NUMKEYS(mp); i > indx; i--)
 		p->ptrs[i] = p->ptrs[i - 1];
@@ -2002,9 +2021,9 @@ static int btree_add_node(struct btree *bt, struct mpage *mp, indx_t indx, struc
 	node->ksize = (key == NULL) ? 0 : key->size;
 	node->flags = flags;
 	if (IS_LEAF(mp))
-		node->n_dsize = data->size;
+		node->p.np_dsize = data->size;
 	else
-		node->n_pgno = pgno;
+		node->p.np_pgno = pgno;
 
 	if (key)
 		memcpy(NODEKEY(node), key->data, key->size);
@@ -2013,16 +2032,12 @@ static int btree_add_node(struct btree *bt, struct mpage *mp, indx_t indx, struc
 		assert(key);
 		if (ofp == NULL) {
 			if (F_ISSET(flags, F_BIGDATA))
-				memcpy(node->data + key->size, data->data,
-				    sizeof(pgno_t));
+				memcpy(node->data + key->size, data->data,sizeof(pgno_t));
 			else
-				memcpy(node->data + key->size, data->data,
-				    data->size);
+				memcpy(node->data + key->size, data->data,data->size);
 		} else {
-			memcpy(node->data + key->size, &ofp->pgno,
-			    sizeof(pgno_t));
-			if (btree_write_overflow_data(bt, ofp->page,
-			    data) == BT_FAIL)
+			memcpy(node->data + key->size, &ofp->pgno,sizeof(pgno_t));
+			if (btree_write_overflow_data(bt, ofp->page,data) == BT_FAIL)
 				return BT_FAIL;
 		}
 	}
@@ -2034,24 +2049,26 @@ static void btree_del_node(struct mpage *mp, indx_t indx)
 {
 	unsigned int	 sz;
 	indx_t		 i, j, numkeys, ptr;
-	struct node	*node;
+	
 	char		*base;
 
-	DPRINTF("delete node %u on %s page %u", indx,
-	    IS_LEAF(mp) ? "leaf" : "branch", mp->pgno);
+	DPRINTF("delete node %u on %s page %u", indx, IS_LEAF(mp) ? "leaf" : "branch", mp->pgno);
 	assert(indx < NUMKEYS(mp));
-
-	node = NODEPTR(mp, indx);
-	sz = NODESIZE + node->ksize;
+	//variable length
+	//array heap
+	///header, array, heap
+	struct node	*node = (struct node*)((char*)mp->page + mp->page->ptrs[indx]); //NODEPTR(mp, indx);
+	sz = offsetof(struct node, data) + node->ksize;
 	if (IS_LEAF(mp)) {
 		if (F_ISSET(node->flags, F_BIGDATA))
 			sz += sizeof(pgno_t);
 		else
-			sz += NODEDSZ(node);
+			sz += node->p.np_dsize;// NODEDSZ(node);
 	}
 
 	ptr = mp->page->ptrs[indx];
-	numkeys = NUMKEYS(mp);
+	numkeys = (mp->page->lower-offsetof(struct page,ptrs))>>1;///NUMKEYS(mp);
+	///a b c d e f  uvwxyz
 	for (i = j = 0; i < numkeys; i++) {
 		if (i != indx) {
 			mp->page->ptrs[j] = mp->page->ptrs[i];
@@ -2062,42 +2079,30 @@ static void btree_del_node(struct mpage *mp, indx_t indx)
 	}
 
 	base = (char *)mp->page + mp->page->upper;
+	// xx y zzz
+	//memcpy( upeer+sz,upper,ptr-upper)
 	memcpy(base + sz, base, ptr - mp->page->upper);
 
 	mp->page->lower -= sizeof(indx_t);
 	mp->page->upper += sz;
 }
 
-struct cursor *
-btree_txn_cursor_open(struct btree *bt, struct btree_txn *txn)
+struct cursor * btree_txn_cursor_open(struct btree_txn *txn)
 {
 	struct cursor	*cursor;
 
-	if (bt != NULL && txn != NULL && bt != txn->bt) {
-		errno = EINVAL;
-		return NULL;
-	}
-
-	if (bt == NULL) {
-		if (txn == NULL) {
-			errno = EINVAL;
-			return NULL;
-		}
-		bt = txn->bt;
-	}
 
 	if ((cursor = calloc(1, sizeof(*cursor))) != NULL) {
 		SLIST_INIT(&cursor->stack);
-		cursor->bt = bt;
+		cursor->bt = txn->bt;
 		cursor->txn = txn;
-		btree_ref(bt);
+		btree_ref(txn->bt);
 	}
 
 	return cursor;
 }
 
-void
-btree_cursor_close(struct cursor *cursor)
+void btree_cursor_close(struct cursor *cursor)
 {
 	if (cursor != NULL) {
 		while (!CURSOR_EMPTY(cursor))
@@ -2108,9 +2113,7 @@ btree_cursor_close(struct cursor *cursor)
 	}
 }
 
-static int
-btree_update_key(struct mpage *mp, indx_t indx,
-    struct btval *key)
+static int btree_update_key(struct mpage *mp, indx_t indx,struct btval *key)
 {
 	indx_t			 ptr, i, numkeys;
 	int			 delta;
@@ -2153,8 +2156,7 @@ btree_update_key(struct mpage *mp, indx_t indx,
 	return BT_SUCCESS;
 }
 
-static int
-btree_adjust_prefix(struct btree *bt, struct mpage *src, int delta)
+static int btree_adjust_prefix(struct btree *bt, struct mpage *src, int delta)
 {
 	indx_t		 i;
 	struct node	*node;
@@ -2258,7 +2260,7 @@ btree_move_node(struct btree *bt, struct mpage *src, indx_t srcindx,
 
 		/* must find the lowest key below src
 		 */
-		assert(btree_search_page_root(bt, src, NULL, NULL, 0,
+		assert(btree_search_leaf_page_from_root(bt, src, NULL, NULL, 0,
 		    &low) == BT_SUCCESS);
 		expand_prefix(bt, low, 0, &srckey);
 		DPRINTF("found lowest key [%.*s] on leaf page %u",
@@ -2368,8 +2370,7 @@ btree_move_node(struct btree *bt, struct mpage *src, indx_t srcindx,
 	return BT_SUCCESS;
 }
 
-static int
-btree_merge(struct btree *bt, struct mpage *src, struct mpage *dst)
+static int btree_merge(struct btree *bt, struct mpage *src, struct mpage *dst)
 {
 	int			 rc;
 	indx_t			 i;
@@ -2415,7 +2416,7 @@ btree_merge(struct btree *bt, struct mpage *src, struct mpage *dst)
 
 			/* must find the lowest key below src
 			 */
-			assert(btree_search_page_root(bt, src, NULL, NULL, 0,
+			assert(btree_search_leaf_page_from_root(bt, src, NULL, NULL, 0,
 			    &low) == BT_SUCCESS);
 			expand_prefix(bt, low, 0, &tmpkey);
 			DPRINTF("found lowest key [%.*s] on leaf page %u",
@@ -2462,8 +2463,7 @@ btree_merge(struct btree *bt, struct mpage *src, struct mpage *dst)
 
 #define FILL_THRESHOLD	 250
 
-static int
-btree_rebalance(struct btree *bt, struct mpage *mp)
+static int btree_rebalance(struct btree *bt, struct mpage *mp)
 {
 	struct node	*node;
 	struct mpage	*parent;
@@ -2561,9 +2561,7 @@ btree_rebalance(struct btree *bt, struct mpage *mp)
 	}
 }
 
-int
-btree_txn_del(struct btree *bt, struct btree_txn *txn,
-    struct btval *key, struct btval *data)
+int btree_txn_del(struct btree_txn *txn,struct btval *key)
 {
 	int		 rc, exact, close_txn = 0;
 	unsigned int	 ki;
@@ -2573,23 +2571,12 @@ btree_txn_del(struct btree *bt, struct btree_txn *txn,
 	DPRINTF("========> delete key %.*s", (int)key->size, (char *)key->data);
 
 	assert(key != NULL);
+	assert(txn);
+	struct btree*  bt = txn->bt;
 
-	if (bt != NULL && txn != NULL && bt != txn->bt) {
+	if (F_ISSET(txn->flags, BT_TXN_RDONLY)) {
 		errno = EINVAL;
 		return BT_FAIL;
-	}
-
-	if (txn != NULL && F_ISSET(txn->flags, BT_TXN_RDONLY)) {
-		errno = EINVAL;
-		return BT_FAIL;
-	}
-
-	if (bt == NULL) {
-		if (txn == NULL) {
-			errno = EINVAL;
-			return BT_FAIL;
-		}
-		bt = txn->bt;
 	}
 
 	if (key->size == 0 || key->size > MAXKEYSIZE) {
@@ -2597,24 +2584,15 @@ btree_txn_del(struct btree *bt, struct btree_txn *txn,
 		return BT_FAIL;
 	}
 
-	if (txn == NULL) {
-		close_txn = 1;
-		if ((txn = btree_txn_begin(bt, 0)) == NULL)
-			return BT_FAIL;
-	}
-
-	if ((rc = btree_search_page(bt, txn, key, NULL, 1, &mp)) != BT_SUCCESS)
+	if ((rc = btree_search_leaf_page(txn->bt, txn, key, NULL, 1, &mp)) != BT_SUCCESS)
 		goto done;
 
-	leaf = btree_search_node(bt, mp, key, &exact, &ki);
+	leaf = btree_search_in_leaf_page(txn->bt, mp, key, &exact, &ki);
 	if (leaf == NULL || !exact) {
 		errno = ENOENT;
 		rc = BT_FAIL;
 		goto done;
 	}
-
-	if (data && (rc = btree_read_data(bt, NULL, leaf, data)) != BT_SUCCESS)
-		goto done;
 
 	btree_del_node(mp, ki);
 	bt->meta.entries--;
@@ -2623,12 +2601,7 @@ btree_txn_del(struct btree *bt, struct btree_txn *txn,
 		txn->flags |= BT_TXN_ERROR;
 
 done:
-	if (close_txn) {
-		if (rc == BT_SUCCESS)
-			rc = btree_txn_commit(txn);
-		else
-			btree_txn_abort(txn);
-	}
+
 	mpage_prune(bt);
 	return rc;
 }
@@ -2692,33 +2665,28 @@ bt_reduce_separator(struct btree *bt, struct node *min, struct btval *sep)
  * *newindxp with the actual values after split, ie if *mpp and *newindxp
  * refer to a node in the new right sibling page.
  */
-static int
-btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newindxp,
-    struct btval *newkey, struct btval *newdata, pgno_t newpgno)
+static int btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newindxp,struct btval *newkey, struct btval *newdata, pgno_t newpgno)
 {
 	uint8_t		 flags;
 	int		 rc = BT_SUCCESS, ins_new = 0;
 	indx_t		 newindx;
 	pgno_t		 pgno = 0;
 	size_t		 orig_pfx_len, left_pfx_diff, right_pfx_diff, pfx_diff;
-	unsigned int	 i, j, split_indx;
+	unsigned int	 i, j;
 	struct node	*node;
-	struct mpage	*pright, *p, *mp;
+	struct mpage	*pright, *p;
 	struct btval	 sepkey, rkey, rdata;
 	struct btkey	 tmpkey;
-	struct page	*copy;
+
 
 	assert(bt != NULL);
 	assert(bt->txn != NULL);
 
-	mp = *mpp;
+	struct mpage * const mp = *mpp;
 	newindx = *newindxp;
 
-	DPRINTF("-----> splitting %s page %u and adding [%.*s] at index %i",
-	    IS_LEAF(mp) ? "leaf" : "branch", mp->pgno,
-	    (int)newkey->size, (char *)newkey->data, *newindxp);
-	DPRINTF("page %u has prefix [%.*s]", mp->pgno,
-	    (int)mp->prefix.len, (char *)mp->prefix.str);
+	DPRINTF("-----> splitting %s page %u and adding [%.*s] at index %i",IS_LEAF(mp) ? "leaf" : "branch", mp->pgno,(int)newkey->size, (char *)newkey->data, *newindxp);
+	DPRINTF("page %u has prefix [%.*s]", mp->pgno,(int)mp->prefix.len, (char *)mp->prefix.str);
 	orig_pfx_len = mp->prefix.len;
 
 	if (mp->parent == NULL) {
@@ -2744,6 +2712,7 @@ btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newindxp,
 	DPRINTF("new right sibling: page %u", pright->pgno);
 
 	/* Move half of the keys to the right sibling. */
+	struct page	*copy;
 	if ((copy = malloc(bt->head.psize)) == NULL)
 		return BT_FAIL;
 	memcpy(copy, mp->page, bt->head.psize);
@@ -2752,7 +2721,7 @@ btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newindxp,
 	mp->page->lower = PAGEHDRSZ;
 	mp->page->upper = bt->head.psize;
 
-	split_indx = NUMKEYSP(copy) / 2 + 1;
+	const unsigned int split_indx = NUMKEYSP(copy) / 2 + 1;
 
 	/* First find the separating key between the split pages.
 	 */
@@ -2787,22 +2756,23 @@ btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newindxp,
 
 	/* Copy separator key to the parent.
 	 */
+	assert(pright->parent==mp->parent);
 	if (SIZELEFT(pright->parent) < bt_branch_size(bt, &sepkey)) {
-		rc = btree_split(bt, &pright->parent, &pright->parent_index,
-		    &sepkey, NULL, pright->pgno);
+		rc = btree_split(bt, &pright->parent, &pright->parent_index,&sepkey, NULL, pright->pgno);
 
 		/* Right page might now have changed parent.
 		 * Check if left page also changed parent.
+
+		 a    a1 a2
+		 bc   b   c
 		 */
-		if (pright->parent != mp->parent &&
-		    mp->parent_index >= NUMKEYS(mp->parent)) {
+		if (pright->parent != mp->parent &&mp->parent_index >= NUMKEYS(mp->parent)) {
 			mp->parent = pright->parent;
 			mp->parent_index = pright->parent_index - 1;
 		}
 	} else {
 		remove_prefix(bt, &sepkey, pright->parent->prefix.len);
-		rc = btree_add_node(bt, pright->parent, pright->parent_index,
-		    &sepkey, NULL, pright->pgno, 0);
+		rc = btree_add_node(bt, pright->parent, pright->parent_index,&sepkey, NULL, pright->pgno, 0);
 	}
 	if (rc != BT_SUCCESS) {
 		free(copy);
@@ -2879,7 +2849,7 @@ btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newindxp,
 	return rc;
 }
 
-int btree_txn_put(struct btree *bt, struct btree_txn *txn,struct btval *key, struct btval *data, unsigned int flags)
+int btree_txn_put(struct btree_txn *txn,struct btval *key, struct btval *data, unsigned int flags)
 {
 	int		 rc = BT_SUCCESS, exact, close_txn = 0;
 	unsigned int	 ki;
@@ -2890,23 +2860,14 @@ int btree_txn_put(struct btree *bt, struct btree_txn *txn,struct btval *key, str
 	assert(key != NULL);
 	assert(data != NULL);
 
-	if (bt != NULL && txn != NULL && bt != txn->bt) {
+
+
+	if ( F_ISSET(txn->flags, BT_TXN_RDONLY)) {
 		errno = EINVAL;
 		return BT_FAIL;
 	}
 
-	if (txn != NULL && F_ISSET(txn->flags, BT_TXN_RDONLY)) {
-		errno = EINVAL;
-		return BT_FAIL;
-	}
-
-	if (bt == NULL) {
-		if (txn == NULL) {
-			errno = EINVAL;
-			return BT_FAIL;
-		}
-		bt = txn->bt;
-	}
+	struct btree* const bt = txn->bt;
 
 	if (key->size == 0 || key->size > MAXKEYSIZE) {
 		errno = EINVAL;
@@ -2916,15 +2877,9 @@ int btree_txn_put(struct btree *bt, struct btree_txn *txn,struct btval *key, str
 	DPRINTF("==> put key %.*s, size %zu, data size %zu",
 		(int)key->size, (char *)key->data, key->size, data->size);
 
-	if (txn == NULL) {
-		close_txn = 1;
-		if ((txn = btree_txn_begin(bt, 0)) == NULL)
-			return BT_FAIL;
-	}
-
-	rc = btree_search_page(bt, txn, key, NULL, 1, &mp);
+	rc = btree_search_leaf_page(bt, txn, key, NULL, 1, &mp);
 	if (rc == BT_SUCCESS) {
-		leaf = btree_search_node(bt, mp, key, &exact, &ki);
+		leaf = btree_search_in_leaf_page(bt, mp, key, &exact, &ki);
 		if (leaf && exact) {
 			if (F_ISSET(flags, BT_NOOVERWRITE)) {
 				DPRINTF("duplicate key %.*s",
@@ -2954,16 +2909,15 @@ int btree_txn_put(struct btree *bt, struct btree_txn *txn,struct btval *key, str
 		goto done;
 
 	assert(IS_LEAF(mp));
-	DPRINTF("there are %lu keys, should insert new key at index %i",
-		NUMKEYS(mp), ki);
+	DPRINTF("there are %lu keys, should insert new key at index %i", NUMKEYS(mp), ki);
 
 	/* Copy the key pointer as it is modified by the prefix code. The
 	 * caller might have malloc'ed the data.
 	 */
 	xkey.data = key->data;
 	xkey.size = key->size;
-
-	if ( (indx_t)(mp->page->upper - mp->page->lower) < bt_leaf_size(bt, key, data)) {
+	const indx_t left_size=(indx_t)(mp->page->upper - mp->page->lower);
+	if (  left_size < bt_leaf_size(bt, key, data)) {
 		rc = btree_split(bt, &mp, &ki, &xkey, data, P_INVALID);
 	} else {
 		/* There is room already in this leaf page. */
@@ -3050,8 +3004,7 @@ static pgno_t btree_compact_tree(struct btree *bt, pgno_t pgno, struct btree *bt
 	return pgno;
 }
 
-int
-btree_compact(struct btree *bt)
+int btree_compact(struct btree *bt)
 {
 	char			*compact_path = NULL;
 
@@ -3129,8 +3082,7 @@ failed:
 
 /* Reverts the last change. Truncates the file at the last root page.
  */
-int
-btree_revert(struct btree *bt)
+int btree_revert(struct btree *bt)
 {
 	if (btree_read_meta(bt, NULL) != 0)
 		return -1;
@@ -3174,3 +3126,55 @@ const struct btree_stat * btree_stat(struct btree *bt)
 	return &bt->stat;
 }
 
+void print_node(int is_data,const struct node * node){
+	if(is_data){
+		if(node->flags&F_BIGDATA){
+
+		}else{
+			const char * data = (char*)node->data + node->ksize;
+			printf("%.*s : %.*s ",node->ksize,node->data,node->p.np_dsize,data );
+		}
+	}else{
+		printf("%.*s > %u ",node->ksize,node->data,node->p.np_pgno );
+	}
+}
+static inline unsigned int page_fill(const struct btree * bt, const struct page * page){
+	const unsigned int header_sz= offsetof(struct page, ptrs);
+	const unsigned int left_size = page->upper-page->lower;
+	return 1000 * (bt->head.psize - header_sz - left_size) / (bt->head.psize - header_sz);
+}
+void 		btree_dump_page(struct btree *bt, unsigned int page_no)
+{
+	struct page * page = malloc(bt->head.psize);
+
+	if (btree_read_page(bt, page_no, page) != BT_SUCCESS) {
+		free(page);
+		return ;
+	}
+	if(page->flags & P_LEAF){
+		const unsigned int n = (page->lower- offsetof(struct page,ptrs))>>1;
+		const unsigned int left_size= page->upper - page->lower;
+		printf("n=%u,left_size=%u, page_fill:%u%%\n",n,left_size,page_fill(bt,page)/10);
+		for(unsigned int k=0;k<n;++k){
+			struct node * node =  (struct node*)((char*)page+page->ptrs[k]);
+			print_node(1,node);
+		}
+		printf("\n");
+
+	}else if(page->flags & P_BRANCH){
+		const unsigned int n = (page->lower- offsetof(struct page,ptrs))>>1;
+		const unsigned int left_size= page->upper - page->lower;
+		printf("n=%u,left_size=%u, page_fill:%u%%\n",n,left_size,page_fill(bt,page)/10);
+		for(unsigned int k=0;k<n;++k){
+			struct node * node =  (struct node*)((char*)page+page->ptrs[k]);
+			print_node(0,node);
+		}
+		printf("\n");
+
+	}else if(page->flags&P_OVERFLOW){
+
+	}else{
+
+	}
+	free(page);
+}
