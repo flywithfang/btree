@@ -73,6 +73,7 @@ struct btree_stat {
 	time_t			 created_at;
 	unsigned long long int writes;
 	unsigned long long int fsyncs;
+	unsigned int 		root;
 };
 
 struct btree		*btree_open_fd(int fd, unsigned int flags);

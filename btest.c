@@ -38,7 +38,7 @@ uint64_t get_cur_us() {
 void dump_stat(struct btree* bt){
 const struct btree_stat * const i= btree_stat(bt);
 		const size_t created_at= i->created_at;
-		printf("timestamp: %s\n", ctime(&created_at));
+		printf("timestamp: %s", ctime(&created_at));
 		printf("depth: %u\n", i->depth);
 		printf("entries: %llu\n", i->entries);
 		printf("revisions: %u\n", i->revisions);
@@ -52,6 +52,7 @@ const struct btree_stat * const i= btree_stat(bt);
 		printf("reads: %llu\n", i->reads);
 		printf("writes: %llu\n", i->writes);
 		printf("fsyncs: %llu\n", i->fsyncs);
+		printf("root: %u\n", i->root);
 }
 int main(int argc, char **argv)
 {
@@ -101,7 +102,8 @@ int main(int argc, char **argv)
 		data.data = argv[2];
 		data.size = strlen(data.data);
 		struct btree_txn	* txn=btree_txn_begin(bt,0);
-		rc = btree_txn_put(bt, &key, &data, 0);
+
+		rc = btree_txn_put(txn, &key, &data, 0);
 		if (rc == BT_SUCCESS)
 			printf("OK\n");
 		else

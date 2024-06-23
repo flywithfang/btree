@@ -444,8 +444,7 @@ static void remove_prefix(struct btree *bt, struct btval *key, size_t pfxlen)
 		key->data = (char *)key->data + pfxlen;
 }
 
-static void
-expand_prefix(struct btree *bt, struct mpage *mp, indx_t indx,
+static void expand_prefix(struct btree *bt, struct mpage *mp, indx_t indx,
     struct btkey *expkey)
 {
 	struct node	*node;
@@ -511,6 +510,7 @@ static void mpage_add(struct btree *bt, struct mpage *mp)
 
 static void mpage_free(struct mpage *mp)
 {
+	//DPRINTF("free page %u",mp->pgno);
 	if (mp != NULL) {
 		free(mp->page);
 		free(mp);
@@ -952,7 +952,7 @@ static int btree_write_meta(struct btree *bt, pgno_t root, unsigned int flags)
 	struct bt_meta	*meta;
 	ssize_t		 rc;
 
-	DPRINTF("writing meta page for root page %u", root);
+	DPRINTF("writing meta page for root page %u %s", root, root==P_INVALID? "tombstone":"");
 
 	assert(bt != NULL);
 	assert(bt->txn != NULL);
@@ -1157,8 +1157,7 @@ fail:
 	return NULL;
 }
 
-struct btree *
-btree_open(const char *path, unsigned int flags, mode_t mode)
+struct btree * btree_open(const char *path, unsigned int flags, mode_t mode)
 {
 	int		 fd, oflags;
 	struct btree	*bt;
@@ -1504,17 +1503,12 @@ static int btree_search_leaf_page(struct btree *bt, struct btree_txn *txn, struc
 	int		 rc;
 	pgno_t		 root;
 	
-	/* Can't modify pages outside a transaction. */
-	if (txn == NULL && modify) {
-		errno = EINVAL;
-		return BT_FAIL;
-	}
-
 	/* Choose which root page to start with. If a transaction is given
          * use the root page from the transaction, otherwise read the last
          * committed root page.
 	 */
 	assert(txn);
+	assert(bt);
 	if (F_ISSET(txn->flags, BT_TXN_ERROR)) {
 		DPRINTF("transaction has failed, must abort");
 		errno = EINVAL;
@@ -2856,7 +2850,7 @@ int btree_txn_put(struct btree_txn *txn,struct btval *key, struct btval *data, u
 	struct node	*leaf;
 	struct mpage	*mp;
 	struct btval	 xkey;
-
+	assert(txn);
 	assert(key != NULL);
 	assert(data != NULL);
 
@@ -3122,6 +3116,7 @@ const struct btree_stat * btree_stat(struct btree *bt)
 	bt->stat.entries = bt->meta.entries;
 	bt->stat.psize = bt->head.psize;
 	bt->stat.created_at = bt->meta.created_at;
+	bt->stat.root=bt->meta.root;
 
 	return &bt->stat;
 }
@@ -3142,6 +3137,14 @@ static inline unsigned int page_fill(const struct btree * bt, const struct page 
 	const unsigned int header_sz= offsetof(struct page, ptrs);
 	const unsigned int left_size = page->upper-page->lower;
 	return 1000 * (bt->head.psize - header_sz - left_size) / (bt->head.psize - header_sz);
+}
+void print_hex_array(const char *array, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        printf("%02x", (unsigned char)array[i]);
+        if (i < length - 1) {
+        }
+    }
+    printf("\n");
 }
 void 		btree_dump_page(struct btree *bt, unsigned int page_no)
 {
@@ -3173,7 +3176,23 @@ void 		btree_dump_page(struct btree *bt, unsigned int page_no)
 
 	}else if(page->flags&P_OVERFLOW){
 
-	}else{
+	}else if(page->flags&P_HEAD){
+
+	}else if(page->flags&P_META){
+		const struct bt_meta meta= *(struct bt_meta*)((char*)page+ offsetof(struct page,ptrs));
+		const size_t created_at= bt->meta.created_at;
+		printf("timestamp: %s", ctime(&created_at));
+		printf("depth: %u\n", meta.depth);
+		printf("entries: %llu\n", meta.entries);
+		printf("revisions: %u\n", meta.revisions);
+		printf("root: %u\n", meta.root);
+		printf("branch pages: %u\n", meta.branch_pages);
+		printf("leaf pages: %u\n", meta.leaf_pages);
+		printf("overflow pages: %u\n", meta.overflow_pages);
+		
+		printf("previous meta page: %u\n", meta.prev_meta);
+		print_hex_array(meta.hash,sizeof(meta.hash));
+
 
 	}
 	free(page);
