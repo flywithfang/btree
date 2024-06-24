@@ -219,11 +219,11 @@ struct btree_txn {
 #define BT_TXN_ERROR		 0x02		/* an error has occurred */
 	unsigned int		 flags;
 };
-
-struct btree {
-	int			 fd;
-	char			*path;
 #define BT_FIXPADDING		 0x01		/* internal */
+struct btree {
+	int			 			fd;
+	char			*		path;
+
 	unsigned int		 flags;
 	bt_cmp_func		 	 cmp;		/* user compare function */
 	struct bt_head		 head;
@@ -234,6 +234,7 @@ struct btree {
 	int			 		ref;		/* increased by cursors & txn */
 	struct btree_stat	stat;
 	off_t			 	size;		/* current file size */
+	pgno_t				meta_pgno;
 };
 
 #define NODESIZE	 offsetof(struct node, data)
@@ -266,8 +267,7 @@ static int		 btree_write_header(struct btree *bt, int fd);
 static int		 btree_read_header(struct btree *bt);
 static int		 btree_is_meta_page(struct page *p);
 static int		 btree_read_meta(struct btree *bt, pgno_t *p_next);
-static int		 btree_write_meta(struct btree *bt, pgno_t root,
-			    unsigned int flags);
+static int		 btree_write_meta(struct btree *bt, pgno_t root);
 static void		 btree_ref(struct btree *bt);
 
 static struct node	*btree_search_in_leaf_page(struct btree *bt, struct mpage *mp,
@@ -822,8 +822,9 @@ int btree_txn_commit(struct btree_txn *txn)
 		if (n == 0)
 			break;
 
-		DPRINTF("commiting %u dirty pages", n);
+		
 		rc = writev(bt->fd, iov, n);
+		printf("commiting %u dirty pages\n", n);
 		bt->stat.writes+=n;
 		if (rc != (ssize_t)bt->head.psize*n) {
 			if (rc > 0)
@@ -846,7 +847,7 @@ int btree_txn_commit(struct btree_txn *txn)
 	} while (!done);
 
 	if (btree_sync(bt) != 0 ||
-	    btree_write_meta(bt, txn->root, 0) != BT_SUCCESS ||
+	    btree_write_meta(bt, txn->root) != BT_SUCCESS ||
 	    btree_sync(bt) != 0) {
 		btree_txn_abort(txn);
 		return BT_FAIL;
@@ -946,21 +947,22 @@ static int btree_read_header(struct btree *bt)
 	return 0;
 }
 
-static int btree_write_meta(struct btree *bt, pgno_t root, unsigned int flags)
+static int btree_write_meta(struct btree *bt, pgno_t root)
 {
 	struct mpage	*mp;
-	struct bt_meta	*meta;
+	
 	ssize_t		 rc;
-
+	const unsigned int flags= root==P_INVALID ? BT_TOMBSTONE:0;
 	DPRINTF("writing meta page for root page %u %s", root, root==P_INVALID? "tombstone":"");
 
 	assert(bt != NULL);
 	assert(bt->txn != NULL);
-
+	assert(root!=bt->meta.root);
+	assert(bt->txn->dirty_queue->sqh_first==NULL);
 	if ((mp = btree_new_page(bt, P_META)) == NULL)
 		return -1;
 
-	bt->meta.prev_meta = bt->meta.root;
+	bt->meta.prev_meta = bt->meta_pgno;
 	bt->meta.root = root;
 	bt->meta.flags = flags;
 	bt->meta.created_at = time(0);
@@ -968,11 +970,12 @@ static int btree_write_meta(struct btree *bt, pgno_t root, unsigned int flags)
 	sha1((unsigned char *)&bt->meta, METAHASHLEN, bt->meta.hash);
 
 	/* Copy the meta data changes to the new meta page. */
-	meta = METADATA(mp->page);
+	struct bt_meta	*meta = METADATA(mp->page);
 	memcpy(meta, &bt->meta, sizeof(*meta));
 
 	rc = write(bt->fd, mp->page, bt->head.psize);
 	mp->dirty = 0;
+
 	SIMPLEQ_REMOVE_HEAD(bt->txn->dirty_queue, next);
 	if (rc != (ssize_t)bt->head.psize) {
 		if (rc > 0)
@@ -984,6 +987,8 @@ static int btree_write_meta(struct btree *bt, pgno_t root, unsigned int flags)
 		DPRINTF("failed to update file size: %s", strerror(errno));
 		bt->size = 0;
 	}
+	assert(mp->page->pgno== (bt->size/bt->head.psize-1));
+	bt->meta_pgno=mp->page->pgno;
 
 	return BT_SUCCESS;
 }
@@ -1022,7 +1027,7 @@ static int btree_read_meta(struct btree *bt, pgno_t *p_next)
 {
 	struct mpage	*mp;
 	
-	pgno_t		 meta_pgno, next_pgno;
+	pgno_t		  next_pgno;
 	off_t		 size;
 
 	assert(bt != NULL);
@@ -1030,7 +1035,7 @@ static int btree_read_meta(struct btree *bt, pgno_t *p_next)
 	if ((size = lseek(bt->fd, 0, SEEK_END)) == -1)
 		goto fail;
 
-	DPRINTF("btree_read_meta: size = %llu", size);
+	//DPRINTF("btree_read_meta: size = %llu", size);
 
 	if (size < bt->size) {
 		DPRINTF("file has shrunk!");
@@ -1051,7 +1056,7 @@ static int btree_read_meta(struct btree *bt, pgno_t *p_next)
 		goto fail;
 	}
 
-	meta_pgno = next_pgno - 1;
+	pgno_t meta_pgno = next_pgno - 1;
 
 	if (size % bt->head.psize != 0) {
 		DPRINTF("filesize not a multiple of the page size!");
@@ -1085,6 +1090,8 @@ static int btree_read_meta(struct btree *bt, pgno_t *p_next)
 				return BT_FAIL;
 			} else {
 				/* Make copy of last meta page. */
+				bt->meta_pgno=mp->page->pgno;
+				assert(bt->meta_pgno);
 				memcpy(&bt->meta, meta, sizeof(bt->meta));
 				return BT_SUCCESS;
 			}
@@ -1212,8 +1219,8 @@ static int btree_search_in_branch_page(struct btree *bt, struct mpage *mp, struc
 	struct node	*node;
 	struct btval	 nodekey;
 
-	DPRINTF("searching %lu keys in %s page %u with prefix [%.*s]",
-	    NUMKEYS(mp),"branch", mp->pgno, (int)mp->prefix.len, (char *)mp->prefix.str);
+	DPRINTF("searching in %lu keys in branch page %u with prefix [%.*s]",
+	    NUMKEYS(mp), mp->pgno, (int)mp->prefix.len, (char *)mp->prefix.str);
 
 	assert(NUMKEYS(mp) > 0);
 
@@ -1441,7 +1448,7 @@ static int btree_search_leaf_page_from_root(struct btree *bt, struct mpage *root
 		unsigned int	 i = 0;
 		struct node	*node;
 
-		DPRINTF("branch page %u has %lu keys", mp->pgno, NUMKEYS(mp));
+		//DPRINTF("branch page %u has %lu keys", mp->pgno, NUMKEYS(mp));
 		assert(NUMKEYS(mp) > 1);
 		//DPRINTF("found index 0 to page %u", NODEPGNO(NODEPTR(mp, 0)));
 
@@ -3041,7 +3048,7 @@ int btree_compact(struct btree *bt)
 		root = btree_compact_tree(bt, bt->meta.root, btc);
 		if (root == P_INVALID)
 			goto failed;
-		if (btree_write_meta(btc, root, 0) != BT_SUCCESS)
+		if (btree_write_meta(btc, root) != BT_SUCCESS)
 			goto failed;
 	}
 
@@ -3054,7 +3061,7 @@ int btree_compact(struct btree *bt)
 	/* Write a "tombstone" meta page so other processes can pick up
 	 * the change and re-open the file.
 	 */
-	if (btree_write_meta(bt, P_INVALID, BT_TOMBSTONE) != BT_SUCCESS)
+	if (btree_write_meta(bt, P_INVALID) != BT_SUCCESS)
 		goto failed;
 
 	btree_txn_abort(txn);
@@ -3116,7 +3123,9 @@ const struct btree_stat * btree_stat(struct btree *bt)
 	bt->stat.entries = bt->meta.entries;
 	bt->stat.psize = bt->head.psize;
 	bt->stat.created_at = bt->meta.created_at;
+	bt->stat.meta=bt->meta_pgno;
 	bt->stat.root=bt->meta.root;
+	bt->stat.prev_meta=bt->meta.prev_meta;
 
 	return &bt->stat;
 }
@@ -3127,7 +3136,7 @@ void print_node(int is_data,const struct node * node){
 
 		}else{
 			const char * data = (char*)node->data + node->ksize;
-			printf("%.*s : %.*s ",node->ksize,node->data,node->p.np_dsize,data );
+			printf("%.*s:%.*s ",node->ksize,node->data,node->p.np_dsize,data );
 		}
 	}else{
 		printf("%.*s > %u ",node->ksize,node->data,node->p.np_pgno );

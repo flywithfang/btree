@@ -52,7 +52,9 @@ const struct btree_stat * const i= btree_stat(bt);
 		printf("reads: %llu\n", i->reads);
 		printf("writes: %llu\n", i->writes);
 		printf("fsyncs: %llu\n", i->fsyncs);
+		printf("meta: %u\n", i->meta);
 		printf("root: %u\n", i->root);
+		printf("prev_meta: %u\n", i->prev_meta);
 }
 int main(int argc, char **argv)
 {
