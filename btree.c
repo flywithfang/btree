@@ -139,7 +139,6 @@ struct mpage {					/* an in-memory cached page */
 	TAILQ_ENTRY(mpage)	 lru_next;	/* LRU queue */
 	struct mpage		*parent;	/* NULL if root */
 	unsigned int		 parent_index;	/* keep track of node index */
-	struct btkey		 prefix;
 	struct page		*page;
 	pgno_t			 pgno;		/* copy of page->pgno */
 	short			 ref;		/* increased by cursors */
@@ -282,8 +281,6 @@ static int		 btree_read_data(struct btree *bt, struct mpage *mp,
 static int		 btree_rebalance(struct btree *bt, struct mpage *mp);
 static int		 btree_update_key(struct mpage *mp,
 			    indx_t indx, struct btval *key);
-static int		 btree_adjust_prefix(struct btree *bt,
-			    struct mpage *src, int delta);
 static int		 btree_move_node(struct btree *bt, struct mpage *src,
 			    indx_t srcindx, struct mpage *dst, indx_t dstindx);
 static int		 btree_merge(struct btree *bt, struct mpage *src,
@@ -311,15 +308,6 @@ static int		 btree_cursor_first(struct cursor *cursor,
 
 static void		 bt_reduce_separator(struct btree *bt, struct node *min,
 			    struct btval *sep);
-static void		 remove_prefix(struct btree *bt, struct btval *key,
-			    size_t pfxlen);
-static void		 expand_prefix(struct btree *bt, struct mpage *mp,
-			    indx_t indx, struct btkey *expkey);
-static void		 concat_prefix(struct btree *bt, char *s1, size_t n1,
-			    char *s2, size_t n2, char *cs, size_t *cn);
-static void		 common_prefix(struct btree *bt, struct btkey *min,
-			    struct btkey *max, struct btkey *pfx);
-static void		 find_common_prefix(struct btree *bt, struct mpage *mp);
 
 static size_t		 bt_leaf_size(struct btree *bt, struct btval *key,
 			    struct btval *data);
@@ -387,80 +375,12 @@ btree_cmp(struct btree *bt, const struct btval *a, const struct btval *b)
 
 }
 
-static void common_prefix(struct btree *bt, struct btkey *min, struct btkey *max,
-    struct btkey *pfx)
-{
-	size_t		 n = 0;
-	char		*p1;
-	char		*p2;
-
-	if (min->len == 0 || max->len == 0) {
-		pfx->len = 0;
-		return;
-	}
-
-	if (F_ISSET(bt->flags, BT_REVERSEKEY)) {
-		p1 = min->str + min->len - 1;
-		p2 = max->str + max->len - 1;
-
-		while (*p1 == *p2) {
-			if (p1 < min->str || p2 < max->str)
-				break;
-			p1--;
-			p2--;
-			n++;
-		}
-
-		assert(n <= (int)sizeof(pfx->str));
-		pfx->len = n;
-		memcpy(pfx->str, p2 + 1, n);
-	} else {
-		p1 = min->str;
-		p2 = max->str;
-
-		while (*p1 == *p2) {
-			if (n == min->len || n == max->len)
-				break;
-			p1++;
-			p2++;
-			n++;
-		}
-
-		assert(n <= (int)sizeof(pfx->str));
-		pfx->len = n;
-		memcpy(pfx->str, max->str, n);
-	}
-}
-
-static void remove_prefix(struct btree *bt, struct btval *key, size_t pfxlen)
-{
-	if (pfxlen == 0 || bt->cmp != NULL)
-		return;
-
-	DPRINTF("removing %zu bytes of prefix from key [%.*s]", pfxlen, (int)key->size, (char *)key->data);
-	assert(pfxlen <= key->size);
-	key->size -= pfxlen;
-	if (!F_ISSET(bt->flags, BT_REVERSEKEY))
-		key->data = (char *)key->data + pfxlen;
-}
-
-static void expand_prefix(struct btree *bt, struct mpage *mp, indx_t indx,
-    struct btkey *expkey)
-{
-	struct node	*node;
-
-	node = NODEPTR(mp, indx);
-	expkey->len = sizeof(expkey->str);
-	concat_prefix(bt, mp->prefix.str, mp->prefix.len,
-	    NODEKEY(node), node->ksize, expkey->str, &expkey->len);
-}
-
-static int bt_cmp(struct btree *bt, const struct btval *key1, const struct btval *key2,struct btkey *pfx)
+static int bt_cmp(struct btree *bt, const struct btval *key1, const struct btval *key2)
 {
 	if (F_ISSET(bt->flags, BT_REVERSEKEY))
-		return memnrcmp(key1->data+ pfx->len, key1->size - pfx->len,key2->data, key2->size);
+		return memnrcmp(key1->data, key1->size,key2->data, key2->size);
 	else
-		return memncmp((char *)key1->data + pfx->len, key1->size - pfx->len,key2->data, key2->size);
+		return memncmp((char *)key1->data, key1->size ,key2->data, key2->size);
 }
 
 void btval_reset(struct btval *btv)
@@ -474,8 +394,7 @@ void btval_reset(struct btval *btv)
 	}
 }
 
-static int
-mpage_cmp(struct mpage *a, struct mpage *b)
+static int mpage_cmp(struct mpage *a, struct mpage *b)
 {
 	if (a->pgno > b->pgno)
 		return 1;
@@ -546,7 +465,7 @@ static struct mpage * mpage_copy(struct btree *bt, struct mpage *mp)
 		return NULL;
 	}
 	memcpy(copy->page, mp->page, bt->head.psize);
-	memcpy(&copy->prefix, &mp->prefix, sizeof(mp->prefix));
+	
 	copy->parent = mp->parent;
 	copy->parent_index = mp->parent_index;
 	copy->pgno = mp->pgno;
@@ -1219,8 +1138,7 @@ static int btree_search_in_branch_page(struct btree *bt, struct mpage *mp, struc
 	struct node	*node;
 	struct btval	 nodekey;
 
-	DPRINTF("searching in %lu keys in branch page %u with prefix [%.*s]",
-	    NUMKEYS(mp), mp->pgno, (int)mp->prefix.len, (char *)mp->prefix.str);
+	DPRINTF("searching in %lu keys in branch page %u ",NUMKEYS(mp), mp->pgno);
 
 	assert(NUMKEYS(mp) > 0);
 
@@ -1238,7 +1156,7 @@ static int btree_search_in_branch_page(struct btree *bt, struct mpage *mp, struc
 		if (bt->cmp)
 			rc = bt->cmp(key, &nodekey);
 		else
-			rc = bt_cmp(bt, key, &nodekey, &mp->prefix);
+			rc = bt_cmp(bt, key, &nodekey);
 
 		DPRINTF("checking branch key: %u [%.*s -> %u]",i, (int)node->ksize, (char *)NODEKEY(node),
 			    node->n_pgno);
@@ -1274,8 +1192,7 @@ static struct node * btree_search_in_leaf_page(struct btree *bt, struct mpage *m
 	struct node	*node;
 	struct btval	 nodekey;
 
-	DPRINTF("searching %lu keys in %s page %u with prefix [%.*s]",
-	    NUMKEYS(mp), "leaf", mp->pgno, (int)mp->prefix.len, (char *)mp->prefix.str);
+	DPRINTF("searching  in %lu keys in leaf page %u ",NUMKEYS(mp), mp->pgno);
 
 	assert(NUMKEYS(mp) > 0);
 
@@ -1293,7 +1210,7 @@ static struct node * btree_search_in_leaf_page(struct btree *bt, struct mpage *m
 		if (bt->cmp)
 			rc = bt->cmp(key, &nodekey);
 		else
-			rc = bt_cmp(bt, key, &nodekey, &mp->prefix);
+			rc = bt_cmp(bt, key, &nodekey);
 
 		DPRINTF("comparing leaf key index %u [%.*s]",i, (int)nodekey.size, (char *)nodekey.data);
 
@@ -1380,60 +1297,6 @@ static struct mpage * btree_get_mpage(struct btree *bt, pgno_t pgno)
 	return mp;
 }
 
-static void
-concat_prefix(struct btree *bt, char *s1, size_t n1, char *s2, size_t n2,
-    char *cs, size_t *cn)
-{
-	assert(*cn >= n1 + n2);
-	if (F_ISSET(bt->flags, BT_REVERSEKEY)) {
-		memcpy(cs, s2, n2);
-		memcpy(cs + n2, s1, n1);
-	} else {
-		memcpy(cs, s1, n1);
-		memcpy(cs + n1, s2, n2);
-	}
-	*cn = n1 + n2;
-}
-
-static void find_common_prefix(struct btree *bt, struct mpage *mp)
-{
-	indx_t			 lbound = 0, ubound = 0;
-	struct mpage		*lp, *up;
-	struct btkey		 lprefix, uprefix;
-
-	mp->prefix.len = 0;
-	if (bt->cmp != NULL)
-		return;
-
-	lp = mp;
-	while (lp->parent != NULL) {
-		if (lp->parent_index > 0) {
-			lbound = lp->parent_index;
-			break;
-		}
-		lp = lp->parent;
-	}
-
-	up = mp;
-	while (up->parent != NULL) {
-		if (up->parent_index + 1 < (indx_t)NUMKEYS(up->parent)) {
-			ubound = up->parent_index + 1;
-			break;
-		}
-		up = up->parent;
-	}
-
-	if (lp->parent != NULL && up->parent != NULL) {
-		expand_prefix(bt, lp->parent, lbound, &lprefix);
-		expand_prefix(bt, up->parent, ubound, &uprefix);
-		common_prefix(bt, &lprefix, &uprefix, &mp->prefix);
-	}
-	else if (mp->parent)
-		memcpy(&mp->prefix, &mp->parent->prefix, sizeof(mp->prefix));
-
-	DPRINTF("found common prefix [%.*s] (len %zu) for page %u",
-	    (int)mp->prefix.len, mp->prefix.str, mp->prefix.len, mp->pgno);
-}
 
 static int btree_search_leaf_page_from_root(struct btree *bt, struct mpage *root, struct btval *key,
     struct cursor *cursor, int modify, struct mpage **mpp)
@@ -1477,7 +1340,6 @@ static int btree_search_leaf_page_from_root(struct btree *bt, struct mpage *root
 		mp->parent = parent;
 		mp->parent_index = i;
 		///abc -> abcd
-		find_common_prefix(bt, mp);
 
 		if (cursor && cursor_push_page(cursor, mp) == NULL)
 			return BT_FAIL;
@@ -1487,8 +1349,7 @@ static int btree_search_leaf_page_from_root(struct btree *bt, struct mpage *root
 	}
 
 	if (!IS_LEAF(mp)) {
-		DPRINTF("internal error, index points to a %02X page!?",
-		    mp->page->flags);
+		DPRINTF("internal error, index points to a %02X page!?",mp->page->flags);
 		return BT_FAIL;
 	}
 
@@ -1536,7 +1397,6 @@ static int btree_search_leaf_page(struct btree *bt, struct btree_txn *txn, struc
 	//DPRINTF("root page has flags 0x%X", mp->page->flags);
 
 	assert(root_page->parent == NULL);
-	assert(root_page->prefix.len == 0);
 
 	if (modify && !root_page->dirty) {
 		if ((root_page = mpage_touch(bt, root_page)) == NULL)
@@ -1637,7 +1497,7 @@ int btree_txn_get( struct btree_txn *txn,struct btval *key, struct btval *data)
 	mpage_prune(bt);
 	return rc;
 }
-static inline print_cursor(const struct ppage*top){
+static inline void print_cursor(const struct ppage*top){
 	DPRINTF("cursor: page:%u,ki:%u/%u", top->mpage->page->pgno,top->ki,NUMKEYS(top->mpage)-1);
 }
 static int btree_sibling(struct cursor *cursor, int move_right)
@@ -1681,29 +1541,17 @@ static int btree_sibling(struct cursor *cursor, int move_right)
 	mp->parent_index = parent->ki;
 
 	cursor_push_page(cursor, mp);
-	find_common_prefix(cursor->bt, mp);
 
 	return BT_SUCCESS;
 }
 
-static int
-bt_set_key(struct btree *bt, struct mpage *mp, struct node *node,
+static int bt_set_key(struct btree *bt, struct mpage *mp, struct node *node,
     struct btval *key)
 {
 	if (key == NULL)
 		return 0;
 
-	if (mp->prefix.len > 0) {
-		key->size = node->ksize + mp->prefix.len;
-		key->data = malloc(key->size);
-		if (key->data == NULL)
-			return -1;
-		concat_prefix(bt,
-		    mp->prefix.str, mp->prefix.len,
-		    NODEKEY(node), node->ksize,
-		    key->data, &key->size);
-		key->free_data = 1;
-	} else {
+	 {
 		key->size = node->ksize;
 		key->data = NODEKEY(node);
 		key->free_data = 0;
@@ -1959,8 +1807,6 @@ static int btree_write_overflow_data(struct btree *bt, struct page *p, struct bt
 	return BT_SUCCESS;
 }
 
-/* Key prefix should already be stripped.
- */
 static int btree_add_node(struct btree *bt, struct mpage *mp, indx_t indx, struct btval *key, struct btval *data, pgno_t pgno, uint8_t flags)
 {
 	unsigned int	 i;
@@ -2116,7 +1962,7 @@ void btree_cursor_close(struct cursor *cursor)
 
 static int btree_update_key(struct mpage *mp, indx_t indx,struct btval *key)
 {
-	indx_t			 ptr, i, numkeys;
+	indx_t			 ptr;
 	int			 delta;
 	size_t			 len;
 	struct node		*node;
@@ -2137,8 +1983,8 @@ static int btree_update_key(struct mpage *mp, indx_t indx,struct btval *key)
 			return BT_FAIL;
 		}
 
-		numkeys = NUMKEYS(mp);
-		for (i = 0; i < numkeys; i++) {
+		const indx_t numkeys = NUMKEYS(mp);
+		for (int i = 0; i < numkeys; i++) {
 			if (mp->page->ptrs[i] <= ptr)
 				mp->page->ptrs[i] -= delta;
 		}
@@ -2157,215 +2003,130 @@ static int btree_update_key(struct mpage *mp, indx_t indx,struct btval *key)
 	return BT_SUCCESS;
 }
 
-static int btree_adjust_prefix(struct btree *bt, struct mpage *src, int delta)
-{
-	indx_t		 i;
-	struct node	*node;
-	struct btkey	 tmpkey;
-	struct btval	 key;
-
-	DPRINTF("adjusting prefix lengths on page %u with delta %d",
-	    src->pgno, delta);
-	assert(delta != 0);
-
-	for (i = 0; i < NUMKEYS(src); i++) {
-		node = NODEPTR(src, i);
-		tmpkey.len = node->ksize - delta;
-		if (delta > 0) {
-			if (F_ISSET(bt->flags, BT_REVERSEKEY))
-				memcpy(tmpkey.str, NODEKEY(node), tmpkey.len);
-			else
-				memcpy(tmpkey.str, (char *)NODEKEY(node) + delta,
-				    tmpkey.len);
-		} else {
-			if (F_ISSET(bt->flags, BT_REVERSEKEY)) {
-				memcpy(tmpkey.str, NODEKEY(node), node->ksize);
-				memcpy(tmpkey.str + node->ksize, src->prefix.str,
-				    -delta);
-			} else {
-				bcopy(src->prefix.str + src->prefix.len + delta,
-				    tmpkey.str, -delta);
-				memcpy(tmpkey.str - delta, NODEKEY(node),
-				    node->ksize);
-			}
-		}
-		key.size = tmpkey.len;
-		key.data = tmpkey.str;
-		if (btree_update_key(src, i, &key) != BT_SUCCESS)
-			return BT_FAIL;
-	}
-
-	return BT_SUCCESS;
-}
-
 /* Move a node from src to dst.
  */
-static int
-btree_move_node(struct btree *bt, struct mpage *src, indx_t srcindx,
-    struct mpage *dst, indx_t dstindx)
+static int btree_move_node(struct btree *bt, struct mpage *src_page, indx_t srcindx,struct mpage *dst, indx_t dstindx)
 {
 	int			 rc;
-	unsigned int		 pfxlen, mp_pfxlen = 0;
+	
 	struct node		*srcnode;
 	struct mpage		*mp = NULL;
-	struct btkey		 tmpkey, srckey;
+	struct btkey		  srckey;
 	struct btval		 key, data;
 
-	assert(src->parent);
-	assert(dst->parent);
+	assert(src_page->parent);
+	assert(dst_page->parent);
 
-	srcnode = NODEPTR(src, srcindx);
+	srcnode = NODEPTR(src_page, srcindx);
 	DPRINTF("moving %s node %u [%.*s] on page %u to node %u on page %u",
-	    IS_LEAF(src) ? "leaf" : "branch",
+	    IS_LEAF(src_page) ? "leaf" : "branch",
 	    srcindx,
 	    (int)srcnode->ksize, (char *)NODEKEY(srcnode),
-	    src->pgno,
-	    dstindx, dst->pgno);
+	    src_page->pgno,
+	    dstindx, dst_page->pgno);
 
-	find_common_prefix(bt, src);
 
-	if (IS_BRANCH(src)) {
+	if (IS_BRANCH(src_page)) {
 		/* Need to check if the page the moved node points to
 		 * changes prefix.
 		 */
 		if ((mp = btree_get_mpage(bt, NODEPGNO(srcnode))) == NULL)
 			return BT_FAIL;
-		mp->parent = src;
+		mp->parent = src_page;
 		mp->parent_index = srcindx;
-		find_common_prefix(bt, mp);
-		mp_pfxlen = mp->prefix.len;
 	}
 
-	/* Mark src and dst as dirty. */
-	if ((src = mpage_touch(bt, src)) == NULL ||
-	    (dst = mpage_touch(bt, dst)) == NULL)
+	/* Mark src_page and dst_page as dirty. */
+	if ((src_page = mpage_touch(bt, src_page)) == NULL ||
+	    (dst_page = mpage_touch(bt, dst_page)) == NULL)
 		return BT_FAIL;
 
-	find_common_prefix(bt, dst);
 
-	/* Check if src node has destination page prefix. Otherwise the
+
+	/* Check if src_page node has destination page prefix. Otherwise the
 	 * destination page must expand its prefix on all its nodes.
 	 */
 	srckey.len = srcnode->ksize;
 	memcpy(srckey.str, NODEKEY(srcnode), srckey.len);
-	common_prefix(bt, &srckey, &dst->prefix, &tmpkey);
-	if (tmpkey.len != dst->prefix.len) {
-		if (btree_adjust_prefix(bt, dst,
-		    tmpkey.len - dst->prefix.len) != BT_SUCCESS)
-			return BT_FAIL;
-		memcpy(&dst->prefix, &tmpkey, sizeof(tmpkey));
-	}
+	
+/*			   	   3   6     9 
+	  src page  2  3 4   6 7    9 10
+	*/
 
-	if (srcindx == 0 && IS_BRANCH(src)) {
+	if (srcindx == 0 && IS_BRANCH(src_page)) {
 		struct mpage	*low;
 
-		/* must find the lowest key below src
+		/* must find the lowest key below src_page
 		 */
-		assert(btree_search_leaf_page_from_root(bt, src, NULL, NULL, 0,
-		    &low) == BT_SUCCESS);
-		expand_prefix(bt, low, 0, &srckey);
-		DPRINTF("found lowest key [%.*s] on leaf page %u",
-		    (int)srckey.len, srckey.str, low->pgno);
+		assert(btree_search_leaf_page_from_root(bt, src_page, NULL/*key*/, NULL/*cursor*/, 0,&low) == BT_SUCCESS);
+
+		srckey.len = low->ksize;
+		memcpy(srckey.str, NODEKEY(low), low->ksize);
+		DPRINTF("found lowest key [%.*s] on leaf page %u",(int)srckey.len, srckey.str, low->pgno);
 	} else {
 		srckey.len = srcnode->ksize;
 		memcpy(srckey.str, NODEKEY(srcnode), srcnode->ksize);
 	}
-	find_common_prefix(bt, src);
+	
 
-	/* expand the prefix */
-	tmpkey.len = sizeof(tmpkey.str);
-	concat_prefix(bt, src->prefix.str, src->prefix.len,
-	    srckey.str, srckey.len, tmpkey.str, &tmpkey.len);
-
-	/* Add the node to the destination page. Adjust prefix for
-	 * destination page.
-	 */
-	key.size = tmpkey.len;
-	key.data = tmpkey.str;
-	remove_prefix(bt, &key, dst->prefix.len);
+	
+	key.size = srckey.len;
+	key.data = srckey.str;
+	
 	data.size = NODEDSZ(srcnode);
 	data.data = NODEDATA(srcnode);
-	rc = btree_add_node(bt, dst, dstindx, &key, &data, NODEPGNO(srcnode),
-	    srcnode->flags);
+	rc = btree_add_node(bt, dst_page, dstindx, &key, &data, NODEPGNO(srcnode),srcnode->flags);
 	if (rc != BT_SUCCESS)
 		return rc;
 
 	/* Delete the node from the source page.
 	 */
-	btree_del_node(src, srcindx);
+	btree_del_node(src_page, srcindx);
 
 	/* Update the parent separators.
 	 */
-	if (srcindx == 0 && src->parent_index != 0) {
-		expand_prefix(bt, src, 0, &tmpkey);
-		key.size = tmpkey.len;
-		key.data = tmpkey.str;
-		remove_prefix(bt, &key, src->parent->prefix.len);
+	/*			   3   6     9 
+	  src page  2  3 4   6 7    9 10
+	*/
+	if (srcindx == 0 && src_page->parent_index != 0) {
+		
+		struct node * new_src_node=NODEPTR(src_page,0);
+		struct btval key ={.size=new_src_node->ksize, .data=new_src_node->data};
 
-		DPRINTF("update separator for source page %u to [%.*s]",
-		    src->pgno, (int)key.size, (char *)key.data);
-		if (btree_update_key(src->parent, src->parent_index,
-		    &key) != BT_SUCCESS)
+		DPRINTF("update separator for source page %u to [%.*s]",src_page->pgno, (int)key.size, (char *)key.data);
+		if (btree_update_key(src_page->parent, src_page->parent_index, &key) != BT_SUCCESS)
 			return BT_FAIL;
 	}
 
-	if (srcindx == 0 && IS_BRANCH(src)) {
+	if (srcindx == 0 && IS_BRANCH(src_page)) {
 		struct btval	 nullkey;
 		nullkey.size = 0;
-		assert(btree_update_key(src, 0, &nullkey) == BT_SUCCESS);
+		assert(btree_update_key(src_page, 0, &nullkey) == BT_SUCCESS);
 	}
 
-	if (dstindx == 0 && dst->parent_index != 0) {
-		expand_prefix(bt, dst, 0, &tmpkey);
-		key.size = tmpkey.len;
-		key.data = tmpkey.str;
-		remove_prefix(bt, &key, dst->parent->prefix.len);
+	if (dstindx == 0 && dst_page->parent_index != 0) {
+		struct node * new_dst_node=NODEPTR(dst_page,0);
+		struct btval key = {.size = new_dst_node->ksize,.data = NODEKEY(new_dst_node)};
 
 		DPRINTF("update separator for destination page %u to [%.*s]",
-		    dst->pgno, (int)key.size, (char *)key.data);
-		if (btree_update_key(dst->parent, dst->parent_index,
-		    &key) != BT_SUCCESS)
+		    dst_page->pgno, (int)key.size, (char *)key.data);
+		if (btree_update_key(dst_page->parent, dst_page->parent_index,&key) != BT_SUCCESS)
 			return BT_FAIL;
 	}
 
-	if (dstindx == 0 && IS_BRANCH(dst)) {
+	if (dstindx == 0 && IS_BRANCH(dst_page)) {
 		struct btval	 nullkey;
 		nullkey.size = 0;
-		assert(btree_update_key(dst, 0, &nullkey) == BT_SUCCESS);
+		assert(btree_update_key(dst_page, 0, &nullkey) == BT_SUCCESS);
 	}
 
-	/* We can get a new page prefix here!
-	 * Must update keys in all nodes of this page!
-	 */
-	pfxlen = src->prefix.len;
-	find_common_prefix(bt, src);
-	if (src->prefix.len != pfxlen) {
-		if (btree_adjust_prefix(bt, src,
-		    src->prefix.len - pfxlen) != BT_SUCCESS)
-			return BT_FAIL;
-	}
 
-	pfxlen = dst->prefix.len;
-	find_common_prefix(bt, dst);
-	if (dst->prefix.len != pfxlen) {
-		if (btree_adjust_prefix(bt, dst,
-		    dst->prefix.len - pfxlen) != BT_SUCCESS)
-			return BT_FAIL;
-	}
 
-	if (IS_BRANCH(dst)) {
+	if (IS_BRANCH(dst_page)) {
 		assert(mp);
-		mp->parent = dst;
+		mp->parent = dst_page;
 		mp->parent_index = dstindx;
-		find_common_prefix(bt, mp);
-		if (mp->prefix.len != mp_pfxlen) {
-			DPRINTF("moved branch node has changed prefix");
-			if ((mp = mpage_touch(bt, mp)) == NULL)
-				return BT_FAIL;
-			if (btree_adjust_prefix(bt, mp,
-			    mp->prefix.len - mp_pfxlen) != BT_SUCCESS)
-				return BT_FAIL;
-		}
+
 	}
 
 	return BT_SUCCESS;
@@ -2375,10 +2136,8 @@ static int btree_merge(struct btree *bt, struct mpage *src, struct mpage *dst)
 {
 	int			 rc;
 	indx_t			 i;
-	unsigned int		 pfxlen;
 	struct node		*srcnode;
-	struct btkey		 tmpkey, dstpfx;
-	struct btval		 key, data;
+	struct btval	key, data;
 
 	DPRINTF("merging page %u and %u", src->pgno, dst->pgno);
 
@@ -2391,19 +2150,6 @@ static int btree_merge(struct btree *bt, struct mpage *src, struct mpage *dst)
 	    (dst = mpage_touch(bt, dst)) == NULL)
 		return BT_FAIL;
 
-	find_common_prefix(bt, src);
-	find_common_prefix(bt, dst);
-
-	/* Check if source nodes has destination page prefix. Otherwise
-	 * the destination page must expand its prefix on all its nodes.
-	 */
-	common_prefix(bt, &src->prefix, &dst->prefix, &dstpfx);
-	if (dstpfx.len != dst->prefix.len) {
-		if (btree_adjust_prefix(bt, dst,
-		    dstpfx.len - dst->prefix.len) != BT_SUCCESS)
-			return BT_FAIL;
-		memcpy(&dst->prefix, &dstpfx, sizeof(dstpfx));
-	}
 
 	/* Move all nodes from src to dst.
 	 */
@@ -2417,23 +2163,23 @@ static int btree_merge(struct btree *bt, struct mpage *src, struct mpage *dst)
 
 			/* must find the lowest key below src
 			 */
-			assert(btree_search_leaf_page_from_root(bt, src, NULL, NULL, 0,
-			    &low) == BT_SUCCESS);
-			expand_prefix(bt, low, 0, &tmpkey);
-			DPRINTF("found lowest key [%.*s] on leaf page %u",
-			    (int)tmpkey.len, tmpkey.str, low->pgno);
+			assert(btree_search_leaf_page_from_root(bt, src, NULL/*key*/, NULL/*cursor*/, 0/*modify*/,&low) == BT_SUCCESS);
+			struct node * node = (struct node*)((char*)low->page+low->page->ptrs[0]);
+			key.size = node->ksize
+			key.data = (char*)node->data;
+			DPRINTF("found lowest key [%.*s] on leaf page %u",(int)key.size, key.data, low->pgno);
+			
+
 		} else {
-			expand_prefix(bt, src, i, &tmpkey);
+			struct node * node = (struct node*)((char*)src->page+src->page->ptrs[i]);
+			key.size = node->ksize
+			key.data = (char*)node->data;
 		}
 
-		key.size = tmpkey.len;
-		key.data = tmpkey.str;
-
-		remove_prefix(bt, &key, dst->prefix.len);
+		
 		data.size = NODEDSZ(srcnode);
 		data.data = NODEDATA(srcnode);
-		rc = btree_add_node(bt, dst, NUMKEYS(dst), &key,
-		    &data, NODEPGNO(srcnode), srcnode->flags);
+		rc = btree_add_node(bt, dst, NUMKEYS(dst), &key, &data, NODEPGNO(srcnode), srcnode->flags);
 		if (rc != BT_SUCCESS)
 			return rc;
 	}
@@ -2448,10 +2194,6 @@ static int btree_merge(struct btree *bt, struct mpage *src, struct mpage *dst)
 		key.size = 0;
 		if (btree_update_key(src->parent, 0, &key) != BT_SUCCESS)
 			return BT_FAIL;
-
-		pfxlen = src->prefix.len;
-		find_common_prefix(bt, src);
-		assert (src->prefix.len == pfxlen);
 	}
 
 	if (IS_LEAF(src))
@@ -2548,9 +2290,7 @@ static int btree_rebalance(struct btree *bt, struct mpage *mp)
 	/* If the neighbor page is above threshold and has at least two
 	 * keys, move one key from it.
 	 *
-	 * Otherwise we should try to merge them, but that might not be
-	 * possible, even if both are below threshold, as prefix expansion
-	 * might make keys larger. FIXME: detect this
+	 * Otherwise we should try to merge them
 	 */
 	if (PAGEFILL(bt, neighbor) >= FILL_THRESHOLD && NUMKEYS(neighbor) >= 2)
 		return btree_move_node(bt, neighbor, si, mp, di);
@@ -2670,25 +2410,25 @@ static int btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newin
 {
 	uint8_t		 flags;
 	int		 rc = BT_SUCCESS, ins_new = 0;
-	indx_t		 newindx;
+	
 	pgno_t		 pgno = 0;
-	size_t		 orig_pfx_len, left_pfx_diff, right_pfx_diff, pfx_diff;
+
 	unsigned int	 i, j;
 	struct node	*node;
 	struct mpage	*pright, *p;
 	struct btval	 sepkey, rkey, rdata;
-	struct btkey	 tmpkey;
+
 
 
 	assert(bt != NULL);
 	assert(bt->txn != NULL);
 
 	struct mpage * const mp = *mpp;
-	newindx = *newindxp;
+	const indx_t		 newindx = *newindxp;
 
 	DPRINTF("-----> splitting %s page %u and adding [%.*s] at index %i",IS_LEAF(mp) ? "leaf" : "branch", mp->pgno,(int)newkey->size, (char *)newkey->data, *newindxp);
-	DPRINTF("page %u has prefix [%.*s]", mp->pgno,(int)mp->prefix.len, (char *)mp->prefix.str);
-	orig_pfx_len = mp->prefix.len;
+	
+	orig_pfx_len = 0;
 
 	if (mp->parent == NULL) {
 		if ((mp->parent = btree_new_page(bt, P_BRANCH)) == NULL)
@@ -2730,7 +2470,7 @@ static int btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newin
 	if (newindx == split_indx) {
 		sepkey.size = newkey->size;
 		sepkey.data = newkey->data;
-		remove_prefix(bt, &sepkey, mp->prefix.len);
+		
 	} else {
 		node = NODEPTRP(copy, split_indx);
 		sepkey.size = node->ksize;
@@ -2744,14 +2484,6 @@ static int btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newin
 		bt_reduce_separator(bt, node, &sepkey);
 	}
 
-	/* Fix separator wrt parent prefix. */
-	if (bt->cmp == NULL) {
-		tmpkey.len = sizeof(tmpkey.str);
-		concat_prefix(bt, mp->prefix.str, mp->prefix.len,
-		    sepkey.data, sepkey.size, tmpkey.str, &tmpkey.len);
-		sepkey.data = tmpkey.str;
-		sepkey.size = tmpkey.len;
-	}
 
 	DPRINTF("separator is [%.*s]", (int)sepkey.size, (char *)sepkey.data);
 
@@ -2772,7 +2504,7 @@ static int btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newin
 			mp->parent_index = pright->parent_index - 1;
 		}
 	} else {
-		remove_prefix(bt, &sepkey, pright->parent->prefix.len);
+
 		rc = btree_add_node(bt, pright->parent, pright->parent_index,&sepkey, NULL, pright->pgno, 0);
 	}
 	if (rc != BT_SUCCESS) {
@@ -2780,28 +2512,20 @@ static int btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newin
 		return BT_FAIL;
 	}
 
-	/* Update prefix for right and left page, if the parent was split.
-	 */
-	find_common_prefix(bt, pright);
-	assert(orig_pfx_len <= pright->prefix.len);
-	right_pfx_diff = pright->prefix.len - orig_pfx_len;
 
-	find_common_prefix(bt, mp);
-	assert(orig_pfx_len <= mp->prefix.len);
-	left_pfx_diff = mp->prefix.len - orig_pfx_len;
 
 	for (i = j = 0; i <= NUMKEYSP(copy); j++) {
 		if (i < split_indx) {
 			/* Re-insert in left sibling. */
 			p = mp;
-			pfx_diff = left_pfx_diff;
+			
 		} else {
 			/* Insert in right sibling. */
 			if (i == split_indx)
 				/* Reset insert index for right sibling. */
 				j = (i == newindx && ins_new);
 			p = pright;
-			pfx_diff = right_pfx_diff;
+			
 		}
 
 		if (i == newindx && !ins_new) {
@@ -2814,7 +2538,7 @@ static int btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newin
 			} else
 				pgno = newpgno;
 			flags = 0;
-			pfx_diff = p->prefix.len;
+		
 
 			ins_new = 1;
 
@@ -2922,7 +2646,7 @@ int btree_txn_put(struct btree_txn *txn,struct btval *key, struct btval *data, u
 		rc = btree_split(bt, &mp, &ki, &xkey, data, P_INVALID);
 	} else {
 		/* There is room already in this leaf page. */
-		remove_prefix(bt, &xkey, mp->prefix.len);
+		//remove_prefix(bt, &xkey, mp->prefix.len);
 		rc = btree_add_node(bt, mp, ki, &xkey, data, 0, 0);
 	}
 
