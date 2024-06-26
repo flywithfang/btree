@@ -1751,10 +1751,12 @@ static struct mpage * btree_new_page(struct btree *bt, uint32_t flags)
 
 static size_t bt_leaf_size(struct btree *bt, struct btval *key, struct btval *data)
 {
-	size_t		 sz =  offsetof(struct node,data) + key->size + data->size;//LEAFSIZE(key, data);
+	size_t		 sz =  offsetof(struct node,data) + key->size; //+ ;//LEAFSIZE(key, data);
 	if (data->size >= bt->head.psize / BT_MINKEYS) {
 		/* put on overflow page */
-		sz -= data->size - sizeof(pgno_t);
+		sz += sizeof(pgno_t);
+	}else{
+		sz+=data->size;
 	}
 
 	return sz + sizeof(indx_t); // key_size, data_size, offset_size
@@ -1762,9 +1764,9 @@ static size_t bt_leaf_size(struct btree *bt, struct btval *key, struct btval *da
 
 static size_t bt_branch_size(struct btree *bt, struct btval *key)
 {
-	size_t		 sz;
+	size_t		 sz=offsetof(struct node,data)+ (key?key->size:0);
 
-	sz = INDXSIZE(key);
+	//sz = INDXSIZE(key);
 	if (sz >= bt->head.psize / BT_MINKEYS) {
 		/* put on overflow page */
 		/* not implemented */
@@ -2357,60 +2359,14 @@ done:
 	return rc;
 }
 
-/* Reduce the length of the prefix separator <sep> to the minimum length that
- * still makes it uniquely distinguishable from <min>.
- *
- * <min> is guaranteed to be sorted less than <sep>
- *
- * On return, <sep> is modified to the minimum length.
- */
-static void
-bt_reduce_separator(struct btree *bt, struct node *min, struct btval *sep)
-{
-	size_t		 n = 0;
-	char		*p1;
-	char		*p2;
-
-	if (F_ISSET(bt->flags, BT_REVERSEKEY)) {
-
-		assert(sep->size > 0);
-
-		p1 = (char *)NODEKEY(min) + min->ksize - 1;
-		p2 = (char *)sep->data + sep->size - 1;
-
-		while (p1 >= (char *)NODEKEY(min) && *p1 == *p2) {
-			assert(p2 > (char *)sep->data);
-			p1--;
-			p2--;
-			n++;
-		}
-
-		sep->data = p2;
-		sep->size = n + 1;
-	} else {
-
-		assert(min->ksize > 0);
-		assert(sep->size > 0);
-
-		p1 = (char *)NODEKEY(min);
-		p2 = (char *)sep->data;
-
-		while (*p1 == *p2) {
-			p1++;
-			p2++;
-			n++;
-			if (n == min->ksize || n == sep->size)
-				break;
-		}
-
-		sep->size = n + 1;
-	}
-
-	DPRINTF("reduced separator to [%.*s] > [%.*s]",
-	    (int)sep->size, (char *)sep->data,
-	    (int)min->ksize, (char *)NODEKEY(min));
+static inine unsigned int get_page_keys_count(struct *page){
+	return (page->lower-offsetof(struct page, offsets))>>1;
 }
-
+static inline struct node * get_node_n(struct *page, unsigned int i){
+	const unsigned int __max= get_page_keys_count(page);
+	assert(i>=0 && i<__max);
+	return (struct node*)((char*)page+page->offsets[i]);
+}
 /* Split page <*mpp>, and insert <key,(data|newpgno)> in either left or
  * right sibling, at index <*newindxp> (as if unsplit). Updates *mpp and
  * *newindxp with the actual values after split, ie if *mpp and *newindxp
@@ -2419,14 +2375,9 @@ bt_reduce_separator(struct btree *bt, struct node *min, struct btval *sep)
 static int btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newindxp,struct btval *newkey, struct btval *newdata, pgno_t newpgno)
 {
 	uint8_t		 flags;
-	int		 rc = BT_SUCCESS, ins_new = 0;
+	int		 rc = BT_SUCCESS;
 	
 	pgno_t		 pgno = 0;
-
-	unsigned int	 i, j;
-	struct node	*node;
-	struct mpage	*pright, *p;
-	struct btval	 sepkey, rkey, rdata;
 
 
 
@@ -2437,8 +2388,6 @@ static int btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newin
 	const indx_t		 newindx = *newindxp;
 
 	DPRINTF("-----> splitting %s page %u and adding [%.*s] at index %i",IS_LEAF(mp) ? "leaf" : "branch", mp->pgno,(int)newkey->size, (char *)newkey->data, *newindxp);
-	
-	orig_pfx_len = 0;
 
 	if (mp->parent == NULL) {
 		if ((mp->parent = btree_new_page(bt, P_BRANCH)) == NULL)
@@ -2456,7 +2405,8 @@ static int btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newin
 	}
 
 	/* Create a right sibling. */
-	if ((pright = btree_new_page(bt, mp->page->flags)) == NULL)
+	struct mpage	*const pright = btree_new_page(bt, mp->page->flags);
+	if (pright == NULL)
 		return BT_FAIL;
 	pright->parent = mp->parent;
 	pright->parent_index = mp->parent_index + 1;
@@ -2472,26 +2422,21 @@ static int btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newin
 	mp->page->lower = PAGEHDRSZ;
 	mp->page->upper = bt->head.psize;
 
-	const unsigned int split_indx = NUMKEYSP(copy) / 2 + 1;
+	const unsigned int split_indx = get_page_keys_count(copy)/ 2 + 1;
 
 	/* First find the separating key between the split pages.
 	 */
+	struct node	*node=0;
+	struct btval	 sepkey;
 	memset(&sepkey, 0, sizeof(sepkey));
 	if (newindx == split_indx) {
 		sepkey.size = newkey->size;
 		sepkey.data = newkey->data;
 		
 	} else {
-		node = NODEPTRP(copy, split_indx);
+		node = get_node_n(copy, split_indx);
 		sepkey.size = node->ksize;
 		sepkey.data = NODEKEY(node);
-	}
-
-	if (IS_LEAF(mp) && bt->cmp == NULL) {
-		/* Find the smallest separator. */
-		/* Ref: Prefix B-trees, R. Bayer, K. Unterauer, 1977 */
-		node = NODEPTRP(copy, split_indx - 1);
-		bt_reduce_separator(bt, node, &sepkey);
 	}
 
 
@@ -2515,28 +2460,24 @@ static int btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newin
 		}
 	} else {
 
-		rc = btree_add_node(bt, pright->parent, pright->parent_index,&sepkey, NULL, pright->pgno, 0);
+		rc = btree_add_node(bt, pright->parent, pright->parent_index,&sepkey, NULL, pright->pgno, 0/*flags*/);
 	}
 	if (rc != BT_SUCCESS) {
 		free(copy);
 		return BT_FAIL;
 	}
 
-
-
-	for (i = j = 0; i <= NUMKEYSP(copy); j++) {
-		if (i < split_indx) {
-			/* Re-insert in left sibling. */
-			p = mp;
-			
-		} else {
+	struct mpage	*p;
+	struct btval	  rkey, rdata;
+	unsigned int	 i, j;
+	int ins_new = 0;
+	for (i = j = 0; ; j++) {
+	
+		p= i<split_indx ? mp: pright;
 			/* Insert in right sibling. */
-			if (i == split_indx)
-				/* Reset insert index for right sibling. */
-				j = (i == newindx && ins_new);
-			p = pright;
-			
-		}
+		if (i == split_indx)
+			/* Reset insert index for right sibling. */
+			j = (i == newindx && ins_new);
 
 		if (i == newindx && !ins_new) {
 			/* Insert the original entry that caused the split. */
@@ -2558,7 +2499,7 @@ static int btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newin
 		} else if (i == NUMKEYSP(copy)) {
 			break;
 		} else {
-			node = NODEPTRP(copy, i);
+			node = get_node_n(copy,i);//NODEPTRP(copy, i);
 			rkey.data = NODEKEY(node);
 			rkey.size = node->ksize;
 			if (IS_LEAF(mp)) {
@@ -2574,8 +2515,7 @@ static int btree_split(struct btree *bt, struct mpage **mpp, unsigned int *newin
 		if (!IS_LEAF(mp) && j == 0) {
 			/* First branch index doesn't need key data. */
 			rkey.size = 0;
-		} else
-			remove_prefix(bt, &rkey, pfx_diff);
+		} 
 
 		rc = btree_add_node(bt, p, j, &rkey, &rdata, pgno,flags);
 	}
@@ -2595,8 +2535,6 @@ int btree_txn_put(struct btree_txn *txn,struct btval *key, struct btval *data, u
 	assert(key != NULL);
 	assert(data != NULL);
 
-
-
 	if ( F_ISSET(txn->flags, BT_TXN_RDONLY)) {
 		errno = EINVAL;
 		return BT_FAIL;
@@ -2609,8 +2547,7 @@ int btree_txn_put(struct btree_txn *txn,struct btval *key, struct btval *data, u
 		return BT_FAIL;
 	}
 
-	DPRINTF("==> put key %.*s, size %zu, data size %zu",
-		(int)key->size, (char *)key->data, key->size, data->size);
+	DPRINTF("==> put key %.*s, size %zu, data size %zu",(int)key->size, (char *)key->data, key->size, data->size);
 
 	rc = btree_search_leaf_page(bt, txn, key, NULL, 1, &mp);
 	if (rc == BT_SUCCESS) {
@@ -2644,7 +2581,7 @@ int btree_txn_put(struct btree_txn *txn,struct btval *key, struct btval *data, u
 		goto done;
 
 	assert(IS_LEAF(mp));
-	DPRINTF("there are %lu keys, should insert new key at index %i", NUMKEYS(mp), ki);
+	DPRINTF("insert new key at index %i/%u",  ki,NUMKEYS(mp));
 
 	/* Copy the key pointer as it is modified by the prefix code. The
 	 * caller might have malloc'ed the data.
