@@ -35,7 +35,6 @@ struct btval {
 };
 
 typedef int		 (*bt_cmp_func)(const struct btval *a,const struct btval *b);
-typedef void	(*bt_prefix_func)(const struct btval *a,const struct btval *b,struct btval *sep);
 
 #define BT_NOOVERWRITE	 1
 
@@ -44,8 +43,6 @@ enum cursor_op {				/* cursor operations */
 	BT_CURSOR_EXACT,			/* position at key, or fail */
 	BT_FIRST,
 	BT_NEXT,
-	BT_LAST,				/* not implemented */
-	BT_PREV					/* not implemented */
 };
 
 /* return codes */

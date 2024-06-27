@@ -145,7 +145,7 @@ int main(int argc, char **argv)
 			errx(1, "missing argument");
 		key.data = argv[1];
 		key.size = strlen(key.data);
-		struct btree_txn* const txn = btree_txn_begin(bt,1);
+		struct btree_txn* const txn = btree_txn_begin(bt,0);
 		rc = btree_txn_del(txn, &key);
 		if (rc == BT_SUCCESS)
 			printf("OK\n");
@@ -153,7 +153,7 @@ int main(int argc, char **argv)
 			printf("FAIL\n");
 		btree_txn_commit(txn);
 	} 	 else if (strcmp(argv[0], "dels") == 0) {
-		if (argc < 2)
+		if (argc < 3)
 			errx(1, "missing argument");
 		key.data = argv[1];
 		key.size = strlen(key.data);
