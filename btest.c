@@ -99,6 +99,7 @@ int main(int argc, char **argv)
 	else if (strcmp(argv[0], "put") == 0) {
 		if (argc < 3)
 			errx(1, "missing arguments");
+		const uint64_t st=get_cur_us();
 		key.data = argv[1];
 		key.size = strlen(key.data);
 		data.data = argv[2];
@@ -106,35 +107,45 @@ int main(int argc, char **argv)
 		struct btree_txn	* txn=btree_txn_begin(bt,0);
 
 		rc = btree_txn_put(txn, &key, &data, 0);
+
+		btree_txn_commit(txn);
+		const uint64_t et=get_cur_us();
+		printf("put %lu us\n", et-st);
 		if (rc == BT_SUCCESS)
 			printf("OK\n");
 		else
 			printf("FAIL\n");
-		btree_txn_commit(txn);
 	}else	if (strcmp(argv[0], "putn") == 0) {
 		if (argc < 4)
 			errx(1, "missing arguments");
 		int n =atoi(argv[3]);
 		const uint64_t st=get_cur_us();
-		struct btree_txn	* txn=btree_txn_begin(bt,0);
-		assert(txn);
+	
+		
 		char  buf_key[1024];
 		char buf_val[1024];
-		for(int k=0;k<n;++k){
-			snprintf(buf_key, sizeof(buf_key),"%s_%d",argv[1],k);
-			snprintf(buf_val, sizeof(buf_val),"%s_%d",argv[2],k);
-		//	printf("%s\n",buf);
-			key.data = buf_key;
-			key.size = strlen(key.data);
-			data.data = buf_val;
-			data.size = strlen(data.data);
-			assert(data.size);
-			//rc = btree_put(bt, &key, &data, 0);
-			rc = btree_txn_put(txn,&key,&data,0);
-			assert(rc==BT_SUCCESS);
+		const unsigned int B=10240;
+		for(unsigned int rest=n,i=0;rest>0;){
+			struct btree_txn	* txn=btree_txn_begin(bt,0);
+			assert(txn);
+			const unsigned int r= rest<B?rest:B;
+				for(int k=0;k<r;++k){
+					++i;
+					snprintf(buf_key, sizeof(buf_key),"%s_%d",argv[1],i);
+					snprintf(buf_val, sizeof(buf_val),"%s_%d",argv[2],i);
+				//	printf("%s\n",buf);
+					key.data = buf_key;
+					key.size = strlen(key.data);
+					data.data = buf_val;
+					data.size = strlen(data.data);
+					assert(data.size);
+					rc = btree_txn_put(txn,&key,&data,0);
+					assert(rc==BT_SUCCESS);
 
-		}
-		btree_txn_commit(txn);
+				}
+			btree_txn_commit(txn);
+			rest-=r;
+	}
 		const uint64_t et=get_cur_us();
 		printf("putn %lu us\n", et-st);
 		
