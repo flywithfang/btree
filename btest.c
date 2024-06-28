@@ -87,7 +87,7 @@ int main(int argc, char **argv)
 
 	struct btree	*bt = btree_open(filename, flags, 0644);
 	if (bt == NULL)
-		err(1, filename);
+		err(1,"fail to open %s", filename);
 
 	memset(&key, 0,sizeof(key));
 	memset(&data,0, sizeof(data));

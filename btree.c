@@ -711,7 +711,7 @@ int btree_txn_commit(struct btree_txn *txn)
 	if (F_ISSET(bt->flags, BT_FIXPADDING)) {
 		size = lseek(bt->fd, 0, SEEK_END);
 		size += bt->head.psize - (size % bt->head.psize);
-		DPRINTF("extending to multiple of page size: %llu", size);
+		DPRINTF("extending to multiple of page size: %lu", size);
 		if (ftruncate(bt->fd, size) != 0) {
 			DPRINTF("ftruncate: %s", strerror(errno));
 			btree_txn_abort(txn);
@@ -1065,7 +1065,7 @@ struct btree * btree_open_fd(int fd, unsigned int flags)
 	const size_t created_at= bt->meta.created_at;
 	DPRINTF("timestamp: %s", ctime(&created_at));
 	DPRINTF("depth: %u", bt->meta.depth);
-	DPRINTF("entries: %llu", bt->meta.entries);
+	DPRINTF("entries: %lu", bt->meta.entries);
 	DPRINTF("revisions: %u", bt->meta.revisions);
 	DPRINTF("branch pages: %u", bt->meta.branch_pages);
 	DPRINTF("leaf pages: %u", bt->meta.leaf_pages);
@@ -1523,7 +1523,7 @@ int btree_txn_get( struct btree_txn *txn,struct btval *key, struct btval *data)
 	return rc;
 }
 static inline void print_cursor(const struct ppage*top){
-	DPRINTF("cursor: page:%u,ki:%u/%u", top->mpage->page->pgno,top->ki,NUMKEYS(top->mpage)-1);
+	DPRINTF("cursor: page:%u,ki:%u/%u", top->mpage->page->pgno,top->ki,get_page_keys_count(top->mpage->page)-1);
 }
 static int btree_sibling(struct cursor *cursor, int move_right)
 {
@@ -1806,7 +1806,6 @@ static int btree_write_overflow_data(struct btree *bt, struct page *p, struct bt
 	
 	size_t		 sz;
 	
-	pgno_t		*linkp;			/* linked page stored here */
 	struct mpage	*next = NULL;
 
 	const size_t	max = bt->head.psize - PAGEHDRSZ;
@@ -1814,15 +1813,15 @@ static int btree_write_overflow_data(struct btree *bt, struct page *p, struct bt
 	while (done < data->size) {
 		if (next != NULL)
 			p = next->page;
-		linkp = &p->p_next_pgno;
+
 		if (data->size - done > max) {
 			/* need another overflow page */
 			if ((next = btree_new_page(bt, P_OVERFLOW)) == NULL)
 				return BT_FAIL;
-			*linkp = next->pgno;
+			p->b.pb_next_pgno = next->pgno;
 			DPRINTF("linking overflow page %u", next->pgno);
 		} else
-			*linkp = 0;		/* indicates end of list */
+			p->b.pb_next_pgno = 0;		/* indicates end of list */
 		sz = data->size - done;
 		if (sz > max)
 			sz = max;
@@ -1846,10 +1845,9 @@ static int btree_add_node(struct btree *bt, struct mpage *mp, indx_t indx, const
 	p = mp->page;
 	assert(p->upper >= p->lower);
 
-	DPRINTF("add node [%.*s] to %s page %u at index %i, key size %zu",
-	    key ? (int)key->size : 0, key ? (char *)key->data : NULL,
-	    IS_LEAF(mp) ? "leaf" : "branch",
-	    mp->pgno, indx, key ? key->size : 0);
+	DPRINTF("%s page %u :insert node [%.*s] to   at index %i, key size %zu", IS_LEAF(mp) ? "leaf" : "branch", mp->pgno,
+		key ? (int)key->size : 0, key ? (char *)key->data : NULL, 
+	     indx, key ? key->size : 0);
 
 	if (key != NULL)
 		node_size += key->size;
@@ -2069,7 +2067,7 @@ static int btree_move_node(struct btree *bt, struct mpage *src_page, indx_t srci
 /*			   	   3   6     9 
 	  src page  2  3 4   6 7    9 10
 	*/
-
+	// s[i-1]<= x < s[i]
 	if (srcindx == 0 && IS_BRANCH(src_page)) {
 		struct mpage	*low;
 
@@ -2079,7 +2077,7 @@ static int btree_move_node(struct btree *bt, struct mpage *src_page, indx_t srci
 		struct node * node = get_node_n(low->page,0);
 		key.size = node->ksize;
 		key.data = NODEKEY(node);
-		DPRINTF("found lowest key [%.*s] on leaf page %u",(int)key.size, key.data, low->pgno);
+		DPRINTF("found lowest key [%.*s] on leaf page %u",(int)key.size, (char*)key.data, low->pgno);
 	} else {
 		key.size = srcnode->ksize;
 		key.data = NODEKEY(srcnode);
