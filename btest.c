@@ -53,8 +53,11 @@ const struct btree_stat * const i= btree_stat(bt);
 		printf("writes: %llu\n", i->writes);
 		printf("fsyncs: %llu\n", i->fsyncs);
 		printf("meta: %u\n", i->meta);
-		printf("root: %u\n", i->root);
 		printf("prev_meta: %u\n", i->prev_meta);
+		printf("root: %u\n", i->root);
+		printf("split: %lu\n", i->split);
+		printf("merge: %lu\n", i->merge);
+		printf("move: %lu\n", i->move);
 }
 int main(int argc, char **argv)
 {
@@ -115,6 +118,7 @@ int main(int argc, char **argv)
 			printf("OK\n");
 		else
 			printf("FAIL\n");
+		dump_stat(bt);
 	}else	if (strcmp(argv[0], "putn") == 0) {
 		if (argc < 4)
 			errx(1, "missing arguments");
@@ -148,7 +152,7 @@ int main(int argc, char **argv)
 	}
 		const uint64_t et=get_cur_us();
 		printf("putn %lu us\n", et-st);
-		
+		dump_stat(bt);
 		
 	}
 	 else if (strcmp(argv[0], "del") == 0) {
@@ -159,10 +163,11 @@ int main(int argc, char **argv)
 		struct btree_txn* const txn = btree_txn_begin(bt,0);
 		rc = btree_txn_del(txn, &key);
 		if (rc == BT_SUCCESS)
-			printf("OK\n");
+			;//printf("OK\n");
 		else
 			printf("FAIL\n");
 		btree_txn_commit(txn);
+		dump_stat(bt);
 	} 	 else if (strcmp(argv[0], "dels") == 0) {
 		if (argc < 3)
 			errx(1, "missing argument");
@@ -177,12 +182,14 @@ int main(int argc, char **argv)
 			if ( btree_cmp(bt, &key, &maxkey) > 0)
 				break;
 			rc = btree_txn_del(txn, &key);
-			printf("del %s  %.*s\n", rc == BT_SUCCESS ? "OK":"FAIL",
-				(int)key.size, (char *)key.data);
+			if(rc!=BT_SUCCESS)
+				printf("del %s  %.*s\n", rc == BT_SUCCESS ? "OK":"FAIL",
+					(int)key.size, (char *)key.data);
 			flags = BT_NEXT;
 		}
 		btree_cursor_close(cursor);
 		btree_txn_commit(txn);
+		dump_stat(bt);
 	}
 	else if (strcmp(argv[0], "get") == 0) {
 		if (argc < 2)
@@ -201,6 +208,7 @@ int main(int argc, char **argv)
 			printf("FAIL\n");
 		}
 		btree_txn_abort(txn);
+		dump_stat(bt);
 
 	} else if (strcmp(argv[0], "scan") == 0) {
 		if (argc > 1) {
@@ -224,6 +232,7 @@ int main(int argc, char **argv)
 		}
 		btree_cursor_close(cursor);
 		btree_txn_abort(txn);
+		dump_stat(bt);
 	}else if (strcmp(argv[0], "scan2") == 0) {
 		if (argc > 1) {
 			key.data = argv[1];
@@ -251,12 +260,14 @@ int main(int argc, char **argv)
 		}
 		btree_cursor_close(cursor);
 		btree_txn_abort(txn);
+		dump_stat(bt);
 	}  else if (strcmp(argv[0], "compact") == 0) {
 		const uint64_t st=get_cur_us();
 		if ((rc = btree_compact(bt)) != BT_SUCCESS)
 			warn("compact");
 				const uint64_t et=get_cur_us();
 		printf("compact %lu us\n", et-st);
+		dump_stat(bt);
 	} else if (strcmp(argv[0], "revert") == 0) {
 		if ((rc = btree_revert(bt)) != BT_SUCCESS)
 			warn("revert");
@@ -268,7 +279,7 @@ int main(int argc, char **argv)
 	} 
 	else
 		errx(1, "%s: invalid command", argv[0]);
-	dump_stat(bt);
+	
 	btree_close(bt);
 
 	return rc;

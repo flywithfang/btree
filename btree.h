@@ -73,6 +73,9 @@ struct btree_stat {
 	unsigned int        meta;
 	unsigned int 		root;
 	unsigned int   		prev_meta;
+	unsigned  long int        split;
+	unsigned  long int        merge;
+	unsigned  long int        move;
 };
 
 struct btree		*btree_open_fd(int fd, unsigned int flags);
