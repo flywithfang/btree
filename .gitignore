@@ -3,4 +3,4 @@ btest
 test_tree
 test_btree
 *.o
-
+*.log
