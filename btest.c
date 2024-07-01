@@ -30,6 +30,8 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdbool.h>
+const unsigned int B=10240;
 uint64_t get_cur_us() {
       struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -128,7 +130,7 @@ int main(int argc, char **argv)
 		
 		char  buf_key[1024];
 		char buf_val[1024];
-		const unsigned int B=10240;
+		
 		for(unsigned int rest=n,i=0;rest>0;){
 			struct btree_txn	* txn=btree_txn_begin(bt,0);
 			assert(txn);
@@ -171,24 +173,46 @@ int main(int argc, char **argv)
 	} 	 else if (strcmp(argv[0], "dels") == 0) {
 		if (argc < 3)
 			errx(1, "missing argument");
-		key.data = argv[1];
-		key.size = strlen(key.data);
+	
 		maxkey.data = argv[2];
 		maxkey.size = strlen(maxkey.data);
-		struct btree_txn* const txn = btree_txn_begin(bt,0);
-		cursor = btree_txn_cursor_open(txn);
-		flags = BT_CURSOR;
-		while ((rc = btree_cursor_get(cursor, &key, NULL,flags)) == BT_SUCCESS) {
-			if ( btree_cmp(bt, &key, &maxkey) > 0)
-				break;
-			rc = btree_txn_del(txn, &key);
-			if(rc!=BT_SUCCESS)
-				printf("del %s  %.*s\n", rc == BT_SUCCESS ? "OK":"FAIL",
-					(int)key.size, (char *)key.data);
-			flags = BT_NEXT;
-		}
-		btree_cursor_close(cursor);
-		btree_txn_commit(txn);
+
+		bool done=false;
+		unsigned int del=0;
+		for(;!done;){
+			struct btree_txn	* txn=btree_txn_begin(bt,0);
+			assert(txn);
+			unsigned int n=0;
+			struct cursor * cursor = btree_txn_cursor_open(txn);
+			flags = BT_CURSOR;
+			key.data = argv[1];
+			key.size = strlen(key.data);
+			while ((rc = btree_cursor_get(cursor, &key, NULL,flags)) == BT_SUCCESS) {
+				if ( btree_cmp(bt, &key, &maxkey) > 0)
+					{
+						done=true;
+						break;
+					}
+				rc = btree_txn_del(txn, &key);
+				if(rc!=BT_SUCCESS)
+					{
+						done=true;
+						printf("del %s  %.*s\n", rc == BT_SUCCESS ? "OK":"FAIL",(int)key.size, (char *)key.data);
+						break;
+					}
+				flags = BT_NEXT;
+				btval_reset(&key);
+				++n;
+				++del;
+				if(n==B){
+					break;
+				}
+			}
+			btree_cursor_close(cursor);
+			btree_txn_commit(txn);
+			done = rc!= BT_SUCCESS;
+	}
+		printf("deleted %u keys\n", del);
 		dump_stat(bt);
 	}
 	else if (strcmp(argv[0], "get") == 0) {
@@ -229,6 +253,8 @@ int main(int argc, char **argv)
 				break;
 			printf("OK  %.*s %zi\n", (int)key.size, (char *)key.data, data.size);
 			flags = BT_NEXT;
+			btval_reset(&key);
+			btval_reset(&data);
 		}
 		btree_cursor_close(cursor);
 		btree_txn_abort(txn);
@@ -243,12 +269,16 @@ int main(int argc, char **argv)
 		struct btval prev_key; memset(&prev_key,0,sizeof(prev_key));
 		unsigned int n=0,checked=0;
 		while ((rc = btree_cursor_get(cursor, &key, NULL,flags)) == BT_SUCCESS) {
+			assert(key.mp);
+			assert(key.free_data==0);
 			if(prev_key.size){
 				++checked;
+				//printf("%.*s\n",(int)key.size,(char*)key.data);
 				if(btree_cmp(bt,&key,&prev_key)<=0){
 					printf("verify error, [%.*s] : [%.*s]\n",(int)key.size,(char*)key.data,
 						(int)prev_key.size,(char*)prev_key.data);
 				}
+				btval_reset(&prev_key);
 			}
 			prev_key=key;
 			flags = BT_NEXT;

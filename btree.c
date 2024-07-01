@@ -480,7 +480,7 @@ static void mpage_prune(struct btree *bt)
 	struct mpage	*mp, *next;
 
 	for (mp = TAILQ_FIRST(bt->lru_queue); mp; mp = next) {
-		if (bt->stat.cache_size <= bt->stat.max_cache)
+		if (bt->stat.cache_size <= bt->stat.max_cache)//4k*1k 4m
 			break;
 		next = TAILQ_NEXT(mp, lru_next);
 		if (!mp->dirty && mp->ref <= 0) {
@@ -1115,7 +1115,7 @@ void btree_close(struct btree *bt)
 		return;
 
 	if (--bt->ref == 0) {
-		DPRINTF("ref is zero, closing btree %p", bt);
+		printf("ref is zero, closing btree %p\n", bt);
 		close(bt->fd);
 		mpage_flush(bt);
 		free(bt->lru_queue);
