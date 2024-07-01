@@ -233,7 +233,33 @@ int main(int argc, char **argv)
 		btree_cursor_close(cursor);
 		btree_txn_abort(txn);
 		dump_stat(bt);
-	}else if (strcmp(argv[0], "scan2") == 0) {
+	}
+	else if (strcmp(argv[0], "verify") == 0) {
+
+		flags = BT_FIRST;
+
+		struct btree_txn* const txn = btree_txn_begin(bt,1);
+		cursor = btree_txn_cursor_open(txn);
+		struct btval prev_key; memset(&prev_key,0,sizeof(prev_key));
+		unsigned int n=0,checked=0;
+		while ((rc = btree_cursor_get(cursor, &key, NULL,flags)) == BT_SUCCESS) {
+			if(prev_key.size){
+				++checked;
+				if(btree_cmp(bt,&key,&prev_key)<=0){
+					printf("verify error, [%.*s] : [%.*s]\n",(int)key.size,(char*)key.data,
+						(int)prev_key.size,(char*)prev_key.data);
+				}
+			}
+			prev_key=key;
+			flags = BT_NEXT;
+			++n;
+		}
+		btree_cursor_close(cursor);
+		btree_txn_abort(txn);
+		if(checked) ++checked;
+		printf("checked %u/%u\n",checked,n);
+	}
+	else if (strcmp(argv[0], "scan2") == 0) {
 		if (argc > 1) {
 			key.data = argv[1];
 			key.size = strlen(key.data);
